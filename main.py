@@ -6,6 +6,7 @@ import pathlib
 import uvicorn
 import pymysql
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from core.middleware import setup_cors, setup_static_files
 from core.config import get_db_config
 from core.logging import setup_logging
@@ -79,7 +80,8 @@ tags_metadata = [
 # 更新 OpenAPI Schema 的 tags 元数据
 app.openapi_tags = tags_metadata
 
-# 自定义 OpenAPI Schema 生成函数，确保只显示定义的3个标签
+
+# 自定义 OpenAPI Schema 生成函数，确保只显示定义的4个标签
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
@@ -89,7 +91,7 @@ def custom_openapi():
         version=app.version,
         description=app.description,
         routes=app.routes,
-        tags=tags_metadata,  # 只使用定义的3个标签
+        tags=tags_metadata,
     )
     # 过滤掉未定义的标签，只保留 tags_metadata 中定义的标签
     defined_tag_names = {tag["name"] for tag in tags_metadata}
@@ -113,7 +115,12 @@ def custom_openapi():
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 
+
 app.openapi = custom_openapi
+
+# 挂载静态文件目录（/pic -> pic_data）
+pic_path = pathlib.Path(__file__).parent / "pic_data"
+app.mount("/pic", StaticFiles(directory=str(pic_path)), name="pic")
 
 # 添加 CORS 中间件和静态文件（统一配置）
 setup_cors(app)
@@ -130,16 +137,16 @@ if __name__ == "__main__":
     # 初始化数据库表结构
     print("正在初始化数据库...")
     initialize_database()
-    
+
     # 确保数据库存在
     ensure_database()
-    
+
     print("启动综合管理系统 API...")
     print("财务管理系统 API 文档: http://127.0.0.1:8000/docs")
     print("用户中心 API 文档: http://127.0.0.1:8000/docs")
     print("订单系统 API 文档: http://127.0.0.1:8000/docs")
     print("商品管理系统 API 文档: http://127.0.0.1:8000/docs")
-    
+
     # 使用导入字符串以支持热重载
     uvicorn.run(
         "main:app",

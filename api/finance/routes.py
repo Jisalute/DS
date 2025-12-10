@@ -157,7 +157,7 @@ async def get_user_team(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/api/products", response_model=ResponseModel, summary="创建商品")
+@router.post("/finance/products")
 async def create_product(
         product: ProductCreateRequest,
         service: FinanceService = Depends(get_finance_service)
@@ -199,7 +199,7 @@ async def create_product(
         raise HTTPException(status_code=400, detail=f"创建失败: {e}")
 
 
-@router.get("/api/products", response_model=ResponseModel, summary="查询商品列表")
+@router.get("/api/finance/products", response_model=ResponseModel, summary="财务-查询商品列表")
 async def get_products(
         service: FinanceService = Depends(get_finance_service),
         is_member: Optional[int] = Query(None, ge=0, le=1)

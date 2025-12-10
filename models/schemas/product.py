@@ -75,7 +75,7 @@ class ProductModel(BaseModel):
     freight: Decimal = Field(default=Decimal("0.00"), ge=0)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
-    
+
     skus: Optional[List[ProductSkuModel]] = None
     attributes: Optional[List[ProductAttributeModel]] = None
     banners: Optional[List[BannerModel]] = None
