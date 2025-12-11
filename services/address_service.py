@@ -5,17 +5,47 @@ from core.database import get_conn
 class AddressService:
     # ------------- 新增地址 -------------
     @staticmethod
-    def add_address(user_id: int, consignee_name: str, consignee_phone: str, province: str, city: str, district: str, detail: str,
-                  label: str, is_default: bool = False, addr_type: str = "shipping") -> int:
+    def add_address(
+            user_id: int,
+            consignee_name: str,
+            consignee_phone: str,
+            province: str,
+            city: str,
+            district: str,
+            detail: str,
+            label: str,
+            is_default: bool = False,
+            addr_type: str = "shipping",
+            lng: Optional[float] = None,
+            lat: Optional[float] = None,
+    ) -> int:
         with get_conn() as conn:
             with conn.cursor() as cur:
-               if is_default:
-                   cur.execute("UPDATE user_addresses SET is_default=0 WHERE user_id=%s", (user_id,))
-               cur.execute("""
-                   INSERT INTO user_addresses(user_id, consignee_name, consignee_phone, province, city, district, detail, label, is_default, addr_type)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-               """, (user_id, consignee_name, consignee_phone, province, city, district, detail, label, int(is_default), addr_type))
-               return cur.lastrowid
+                if is_default:
+                    cur.execute("UPDATE user_addresses SET is_default=0 WHERE user_id=%s", (user_id,))
+                cur.execute(
+                    """
+                    INSERT INTO user_addresses
+                    (user_id, label, consignee_name, consignee_phone,
+                     province, city, district, detail,
+                     lng, lat, is_default, addr_type)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        user_id,
+                        label,
+                        consignee_name,
+                        consignee_phone,
+                        province,
+                        city,
+                        district,
+                        detail,
+                        lng or None,
+                        lat or None,
+                        int(is_default),
+                        addr_type,
+                    ))
+                return cur.lastrowid
 
     # ------------- 删除地址 -------------
     @staticmethod
@@ -47,12 +77,12 @@ class AddressService:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT id, consignee_name, consignee_phone, province, city, district, detail, label, is_default, created_at
-                    FROM user_addresses
-                    WHERE user_id=%s
-                    ORDER BY is_default DESC, id DESC
-                    LIMIT %s OFFSET %s
-                """, (user_id, size, (page - 1) * size))
+                        SELECT id, consignee_name, consignee_phone, province, city, district, detail, label, is_default, created_at
+                        FROM user_addresses
+                        WHERE user_id=%s
+                        ORDER BY is_default DESC, id DESC
+                        LIMIT %s OFFSET %s
+                    """, (user_id, size, (page - 1) * size))
                 return cur.fetchall()
 
     # ------------- 获取默认地址 -------------

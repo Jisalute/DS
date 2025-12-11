@@ -55,7 +55,7 @@ class AddressReq(BaseModel):
 class PointsReq(BaseModel):
     """积分请求"""
     mobile: str
-    points_type: str = Field(pattern="^(member|merchant)$")
+    type: str = Field(pattern="^(member|merchant)$")
     amount: float = Field(..., ge=0, description="积分数量，支持小数点后4位精度")
     reason: str = "系统赠送"
 

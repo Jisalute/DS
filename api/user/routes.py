@@ -362,41 +362,38 @@ def refer_team(mobile: str, max_layer: int = 6):
 # 地址模块
 @router.post("/address", summary="新增地址")
 def address_add(body: AddressReq):
+    print(f"[INSERT] mobile={body.mobile}, name={body.name}")
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM users WHERE mobile=%s", (body.mobile,))
             u = cur.fetchone()
             if not u:
                 _err("用户不存在")
+
             addr_id = AddressService.add_address(
                 u["id"],
-                body.name,  # consignee_name
-                body.phone,  # consignee_phone
+                body.name,
+                body.phone,
                 body.province,
                 body.city,
                 body.district,
                 body.detail,
-                body.label,  # ❗新增这一行
+                body.label,
                 body.is_default,
                 body.addr_type
             )
             return {"addr_id": addr_id}
-
 @router.put("/address/default", summary="把已有地址设为默认")
 def set_default_addr(addr_id: int, mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT user_id FROM addresses WHERE id=%s", (addr_id,))
+            cur.execute("SELECT user_id FROM user_addresses WHERE id=%s", (addr_id,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="地址不存在")
-            cur.execute("SELECT id FROM users WHERE mobile=%s", (mobile,))
-            u = cur.fetchone()
-            if not u or u["id"] != row["user_id"]:
-                raise HTTPException(status_code=403, detail="地址不属于当前用户")
-
-            cur.execute("UPDATE addresses SET is_default=0 WHERE user_id=%s", (u["id"],))
-            cur.execute("UPDATE addresses SET is_default=1 WHERE id=%s", (addr_id,))
+            user_id = row["user_id"]
+            cur.execute("UPDATE user_addresses SET is_default=0 WHERE user_id=%s", (user_id,))
+            cur.execute("UPDATE user_addresses SET is_default=1 WHERE id=%s", (addr_id,))
             conn.commit()
     return {"msg": "ok"}
 
@@ -438,7 +435,7 @@ def return_addr_set(body: AddressReq):
                 _err("商家不存在")
             addr_id = AddressService.add_address(
                 u["id"], body.name, body.phone, body.province, body.city,
-                body.district, body.detail, is_default=True, addr_type="return"
+                body.district, body.detail, body.label, is_default=True, addr_type="return"
             )
             return {"addr_id": addr_id}
 
@@ -467,7 +464,7 @@ def points(body: PointsReq):
                 if not row:
                     raise HTTPException(status_code=404, detail="用户不存在")
                 user_id = row["id"]
-        add_points(user_id, body.points_type, Decimal(str(body.amount)), body.reason)
+        add_points(user_id, body.type, Decimal(str(body.amount)), body.reason)
         return {"msg": "ok"}
     except ValueError as e:
         _err(str(e))
@@ -490,7 +487,7 @@ def points_log(mobile: str, points_type: str = "member", page: int = 1, size: in
             u = cur.fetchone()
             if not u:
                 _err("用户不存在")
-            where, args = ["user_id=%s", "points_type=%s"], [u["id"], points_type]
+            where, args = ["user_id=%s", "type=%s"], [u["id"], points_type]  # 修改为正确的列名 type
             sql_where = " AND ".join(where)
             sql = f"""
                 SELECT change_amount, reason, related_order, created_at
