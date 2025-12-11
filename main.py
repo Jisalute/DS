@@ -21,7 +21,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 # 导入路由注册函数（使用新的目录结构）
 from api.finance.routes import register_finance_routes
 from api.user.routes import register_routes as register_user_routes
-from api.order import register_routes as register_order_routes
 from api.product.routes import register_routes as register_product_routes
 
 
@@ -129,6 +128,19 @@ def custom_openapi():
 
 
 app.openapi = custom_openapi
+
+# 挂载静态文件目录（/pic -> pic_data）
+pic_path = pathlib.Path(__file__).parent / "pic_data"
+app.mount("/pic", StaticFiles(directory=str(pic_path)), name="pic")
+
+# 添加 CORS 中间件和静态文件（统一配置）
+setup_cors(app)
+setup_static_files(app)
+
+# 注册所有模块的路由
+register_finance_routes(app)
+register_user_routes(app)
+register_product_routes(app)
 
 
 if __name__ == "__main__":
