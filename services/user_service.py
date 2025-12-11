@@ -187,7 +187,18 @@ class UserService:
         """授予商家权限"""
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # 如果表缺少 is_merchant 字段，先尝试添加（兼容旧库）
+                cur.execute("SHOW COLUMNS FROM users LIKE 'is_merchant'")
+                if not cur.fetchone():
+                    try:
+                        cur.execute("ALTER TABLE users ADD COLUMN is_merchant TINYINT(1) NOT NULL DEFAULT 0")
+                        conn.commit()
+                    except Exception:
+                        # 若无法添加字段（权限等问题），继续尝试更新会报错，返回 False
+                        return False
+
                 cur.execute("UPDATE users SET is_merchant=1 WHERE mobile=%s", (mobile,))
+                conn.commit()
                 return cur.rowcount > 0
 
     @staticmethod
@@ -195,9 +206,13 @@ class UserService:
         """检查是否为商家"""
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # 兼容旧库：若 users 表没有 is_merchant 字段，视为非商家
+                cur.execute("SHOW COLUMNS FROM users LIKE 'is_merchant'")
+                if not cur.fetchone():
+                    return False
                 cur.execute("SELECT is_merchant FROM users WHERE mobile=%s", (mobile,))
                 row = cur.fetchone()
-                return bool(row and row['is_merchant'])
+                return bool(row and row.get('is_merchant'))
 
     @staticmethod
     def set_status(mobile: str, new_status: UserStatus, reason: str = "后台调整") -> bool:

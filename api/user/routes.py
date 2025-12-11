@@ -677,11 +677,17 @@ def address_list(mobile: str, page: int = 1, size: int = 5):
 def return_addr_set(body: AddressReq):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # 1. 校验商家身份
-            cur.execute("SELECT id FROM users WHERE mobile=%s AND is_merchant=1", (body.mobile,))
+            # 1. 校验商家身份（兼容老表可能缺少 is_merchant 字段）
+            cur.execute("SELECT id FROM users WHERE mobile=%s", (body.mobile,))
             u = cur.fetchone()
             if not u:
                 raise HTTPException(status_code=404, detail="商家不存在或未被授予商户身份")
+
+            # 检查是否存在 is_merchant 字段并判断是否为商家
+            cur.execute("SHOW COLUMNS FROM users LIKE 'is_merchant'")
+            if not cur.fetchone() or u.get("is_merchant") != 1:
+                raise HTTPException(status_code=404, detail="商家不存在或未被授予商户身份")
+
             user_id = u["id"]
 
             # 2. 嗅探真实字段
