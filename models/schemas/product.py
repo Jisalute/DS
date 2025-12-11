@@ -1,5 +1,5 @@
 # models/schemas/product.py - 商品系统 Pydantic 模型
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, List
 from decimal import Decimal
 from datetime import datetime
@@ -23,12 +23,7 @@ class ProductSkuModel(BaseModel):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
-        json_encoders = {
-            Decimal: str,
-            datetime: lambda v: v.isoformat() if v else None
-        }
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ProductAttributeModel(BaseModel):
@@ -38,8 +33,7 @@ class ProductAttributeModel(BaseModel):
     name: str = Field(..., max_length=100)
     value: str = Field(..., max_length=255)
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class BannerModel(BaseModel):
@@ -52,11 +46,7 @@ class BannerModel(BaseModel):
     status: int = Field(default=1, ge=0, le=1)
     created_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
-        json_encoders = {
-            datetime: lambda v: v.isoformat() if v else None
-        }
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ProductModel(BaseModel):
@@ -80,12 +70,7 @@ class ProductModel(BaseModel):
     attributes: Optional[List[ProductAttributeModel]] = None
     banners: Optional[List[BannerModel]] = None
 
-    class Config:
-        from_attributes = True
-        json_encoders = {
-            Decimal: str,
-            datetime: lambda v: v.isoformat() if v else None
-        }
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ProductCreateRequest(BaseModel):
@@ -139,12 +124,7 @@ class ProductResponse(BaseModel):
     attributes: Optional[List[ProductAttributeModel]] = None
     banners: Optional[List[BannerModel]] = None
 
-    class Config:
-        from_attributes = True
-        json_encoders = {
-            Decimal: str,
-            datetime: lambda v: v.isoformat() if v else None
-        }
+    model_config = ConfigDict(from_attributes=True)
 
 
 class BannerCreateRequest(BaseModel):
@@ -166,8 +146,4 @@ class BannerResponse(BaseModel):
     status: int
     created_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
-        json_encoders = {
-            datetime: lambda v: v.isoformat() if v else None
-        }
+    model_config = ConfigDict(from_attributes=True)
