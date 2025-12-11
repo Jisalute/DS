@@ -80,8 +80,20 @@ tags_metadata = [
 # 更新 OpenAPI Schema 的 tags 元数据
 app.openapi_tags = tags_metadata
 
+app.mount("/pic", StaticFiles(directory=str(PIC_PATH)), name="pic")
+# 添加 CORS 中间件和静态文件（统一配置）pic_path
+setup_cors(app)
+setup_static_files(app)
+
+# 注册所有模块的路由（必须在设置 custom_openapi 之前注册）
+register_finance_routes(app)
+register_user_routes(app)
+register_order_routes(app)
+register_product_routes(app)
+
 
 # 自定义 OpenAPI Schema 生成函数，确保只显示定义的4个标签
+# 注意：必须在路由注册之后设置，否则 schema 中不会包含路由
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
@@ -117,17 +129,6 @@ def custom_openapi():
 
 
 app.openapi = custom_openapi
-
-app.mount("/pic", StaticFiles(directory=str(PIC_PATH)), name="pic")
-# 添加 CORS 中间件和静态文件（统一配置）pic_path
-setup_cors(app)
-setup_static_files(app)
-
-# 注册所有模块的路由
-register_finance_routes(app)
-register_user_routes(app)
-register_order_routes(app)
-register_product_routes(app)
 
 
 if __name__ == "__main__":
