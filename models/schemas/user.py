@@ -48,8 +48,7 @@ class AddressReq(BaseModel):
     is_default: bool = False
     addr_type: str = "shipping"
 
-    class Config:
-        model_config = ConfigDict(validate_by_name=True)   # 同时支持 name / consignee_name
+    model_config = ConfigDict(validate_by_name=True)  # Pydantic V2: 同时支持 name / consignee_name
 
 
 class PointsReq(BaseModel):

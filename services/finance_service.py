@@ -1410,44 +1410,117 @@ class FinanceService:
 
 # ==================== 订单系统财务功能（来自 order/finance.py） ====================
 
-def split_order_funds(order_number: str, total: Decimal, is_vip: bool):
+def split_order_funds(order_number: str, total: Decimal, is_vip: bool, cursor=None):
     """订单分账：将订单金额分配给商家和各个资金池
 
     参数:
         order_number: 订单号
         total: 订单总金额
         is_vip: 是否为会员订单
+        cursor: 数据库游标（可选），如果提供则在同一事务中执行
     """
     from core.database import get_conn
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            # 商家分得 80%
-            merchant = total * Decimal("0.8")
-            cur.execute(
-                "INSERT INTO order_split(order_number,item_type,amount) VALUES(%s,'merchant',%s)",
-                (order_number, merchant)
-            )
+    if cursor is not None:
+        cur = cursor
+        use_external_cursor = True
+    else:
+        use_external_cursor = False
 
-            # 平台分得 20%，再分配到各个资金池
-            pool_total = total * Decimal("0.2")
-            pools = {
-                "public": 0.01,  # 公益基金
-                "maintain": 0.01,  # 平台维护
-                "subsidy": 0.12,  # 周补贴池
-                "director": 0.02,  # 荣誉董事分红
-                "shop": 0.01,  # 社区店
-                "city": 0.01,  # 城市运营中心
-                "branch": 0.005,  # 大区分公司
-                "fund": 0.015  # 事业发展基金
-            }
-            for k, v in pools.items():
-                amt = pool_total * Decimal(str(v))
-                cur.execute(
-                    "INSERT INTO order_split(order_number,item_type,amount,pool_type) VALUES(%s,'pool',%s,%s)",
-                    (order_number, amt, k)
-                )
-            conn.commit()
+    try:
+        if not use_external_cursor:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    _execute_split(cur, order_number, total)
+                    conn.commit()
+        else:
+            _execute_split(cur, order_number, total)
+    except Exception as e:
+        if not use_external_cursor:
+            raise
+        raise
+
+
+def _execute_split(cur, order_number: str, total: Decimal):
+    """执行订单分账逻辑（内部函数）
+    
+    参数:
+        cur: 数据库游标
+        order_number: 订单号
+        total: 订单总金额
+    """
+    # 商家分得 80%
+    merchant = total * Decimal("0.8")
+    
+    # 更新商家余额（使用 merchant_balance 表）
+    cur.execute(
+        "UPDATE merchant_balance SET balance=balance+%s WHERE merchant_id=1",
+        (merchant,)
+    )
+    
+    # 获取商家余额
+    cur.execute("SELECT balance FROM merchant_balance WHERE merchant_id=1")
+    merchant_balance_row = cur.fetchone()
+    merchant_balance_after = merchant_balance_row["balance"] if merchant_balance_row else merchant
+    
+    # 记录商家流水到 account_flow
+    cur.execute(
+        """INSERT INTO account_flow (account_type, change_amount, balance_after, flow_type, remark, created_at)
+           VALUES (%s, %s, %s, %s, %s, NOW())""",
+        ("merchant_balance", merchant, merchant_balance_after, "income", f"订单分账: {order_number}")
+    )
+    
+    # 平台分得 20%，再分配到各个资金池
+    pool_total = total * Decimal("0.2")
+    # 池子类型到账户类型的映射
+    pool_mapping = {
+        "public": "public_welfare",  # 公益基金
+        "maintain": "maintain_pool",  # 平台维护
+        "subsidy": "subsidy_pool",  # 周补贴池
+        "director": "director_pool",  # 荣誉董事分红
+        "shop": "shop_pool",  # 社区店
+        "city": "city_pool",  # 城市运营中心
+        "branch": "branch_pool",  # 大区分公司
+        "fund": "fund_pool"  # 事业发展基金
+    }
+    pools = {
+        "public": 0.01,  # 公益基金
+        "maintain": 0.01,  # 平台维护
+        "subsidy": 0.12,  # 周补贴池
+        "director": 0.02,  # 荣誉董事分红
+        "shop": 0.01,  # 社区店
+        "city": 0.01,  # 城市运营中心
+        "branch": 0.005,  # 大区分公司
+        "fund": 0.015  # 事业发展基金
+    }
+    
+    for pool_key, pool_ratio in pools.items():
+        amt = pool_total * Decimal(str(pool_ratio))
+        account_type = pool_mapping[pool_key]
+        
+        # 确保 finance_accounts 中存在该账户类型
+        cur.execute(
+            "INSERT INTO finance_accounts (account_name, account_type, balance) VALUES (%s, %s, 0) ON DUPLICATE KEY UPDATE account_name=VALUES(account_name)",
+            (pool_key, account_type)
+        )
+        
+        # 更新资金池余额
+        cur.execute(
+            "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
+            (amt, account_type)
+        )
+        
+        # 获取更新后的余额
+        cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (account_type,))
+        balance_row = cur.fetchone()
+        balance_after = balance_row["balance"] if balance_row else amt
+        
+        # 记录流水到 account_flow
+        cur.execute(
+            """INSERT INTO account_flow (account_type, change_amount, balance_after, flow_type, remark, created_at)
+               VALUES (%s, %s, %s, %s, %s, NOW())""",
+            (account_type, amt, balance_after, "income", f"订单分账: {order_number}")
+        )
 
 
 def reverse_split_on_refund(order_number: str):
@@ -1460,17 +1533,73 @@ def reverse_split_on_refund(order_number: str):
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # 回冲商家余额
+            # 从 account_flow 查询商家分得金额
             cur.execute(
-                "SELECT SUM(amount) AS m FROM order_split WHERE order_number=%s AND item_type='merchant'",
-                (order_number,)
+                """SELECT SUM(change_amount) AS m FROM account_flow 
+                   WHERE account_type='merchant_balance' AND remark LIKE %s AND flow_type='income'""",
+                (f"订单分账: {order_number}%",)
             )
             m = cur.fetchone()["m"] or Decimal("0")
-            cur.execute(
-                "UPDATE merchant_balance SET balance=balance-%s WHERE merchant_id=1",
-                (m,)
-            )
-            # 注意：资金池回冲逻辑可根据实际需求实现
+            
+            if m > 0:
+                # 回冲商家余额
+                cur.execute(
+                    "UPDATE merchant_balance SET balance=balance-%s WHERE merchant_id=1",
+                    (m,)
+                )
+                
+                # 获取回冲后的余额
+                cur.execute("SELECT balance FROM merchant_balance WHERE merchant_id=1")
+                merchant_balance_row = cur.fetchone()
+                merchant_balance_after = merchant_balance_row["balance"] if merchant_balance_row else Decimal("0")
+                
+                # 记录回冲流水
+                cur.execute(
+                    """INSERT INTO account_flow (account_type, change_amount, balance_after, flow_type, remark, created_at)
+                       VALUES (%s, %s, %s, %s, %s, NOW())""",
+                    ("merchant_balance", -m, merchant_balance_after, "expense", f"退款回冲: {order_number}")
+                )
+            
+            # 回冲各个资金池
+            pool_mapping = {
+                "public": "public_welfare",
+                "maintain": "maintain_pool",
+                "subsidy": "subsidy_pool",
+                "director": "director_pool",
+                "shop": "shop_pool",
+                "city": "city_pool",
+                "branch": "branch_pool",
+                "fund": "fund_pool"
+            }
+            
+            for pool_key, account_type in pool_mapping.items():
+                # 查询该池子的分账金额
+                cur.execute(
+                    """SELECT SUM(change_amount) AS amt FROM account_flow 
+                       WHERE account_type=%s AND remark LIKE %s AND flow_type='income'""",
+                    (account_type, f"订单分账: {order_number}%")
+                )
+                pool_amt = cur.fetchone()["amt"] or Decimal("0")
+                
+                if pool_amt > 0:
+                    # 回冲资金池余额
+                    cur.execute(
+                        "UPDATE finance_accounts SET balance = balance - %s WHERE account_type = %s",
+                        (pool_amt, account_type)
+                    )
+                    
+                    # 获取回冲后的余额
+                    cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (account_type,))
+                    balance_row = cur.fetchone()
+                    balance_after = balance_row["balance"] if balance_row else Decimal("0")
+                    
+                    # 记录回冲流水
+                    cur.execute(
+                        """INSERT INTO account_flow (account_type, change_amount, balance_after, flow_type, remark, created_at)
+                           VALUES (%s, %s, %s, %s, %s, NOW())""",
+                        (account_type, -pool_amt, balance_after, "expense", f"退款回冲: {order_number}")
+                    )
+            
             conn.commit()
 
 
@@ -1586,9 +1715,10 @@ def generate_statement():
             row = cur.fetchone()
             opening = row["closing_balance"] if row else Decimal("0")
 
-            # 获取当日收入
+            # 获取当日收入（从 account_flow 表查询）
             cur.execute(
-                "SELECT SUM(amount) AS income FROM order_split WHERE item_type='merchant' AND DATE(created_at)=%s",
+                """SELECT SUM(change_amount) AS income FROM account_flow 
+                   WHERE account_type='merchant_balance' AND flow_type='income' AND DATE(created_at)=%s""",
                 (yesterday,)
             )
             income = cur.fetchone()["income"] or Decimal("0")

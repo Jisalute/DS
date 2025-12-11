@@ -31,18 +31,33 @@ class OrderManager:
                                VALUES(%s,%s,%s,%s,'pending_pay',%s,%s)""",
                             (user_id, order_number, order_number, total, has_vip, datetime.now() + timedelta(days=7)))
                 oid = cur.lastrowid
+                # 检查库存是否充足
+                for i in items:
+                    cur.execute("SELECT stock FROM products WHERE id=%s", (i['product_id'],))
+                    product_stock = cur.fetchone()['stock']
+                    if product_stock < i["quantity"]:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"商品库存不足：商品ID {i['product_id']} 当前库存 {product_stock}，需要 {i['quantity']}"
+                        )
+                
                 # 明细
                 for i in items:
                     cur.execute("""INSERT INTO order_items(order_id,product_id,quantity,unit_price,total_price)
                                    VALUES(%s,%s,%s,%s,%s)""",
                                 (oid, i["product_id"], i["quantity"], i["price"], Decimal(str(i["quantity"])) * Decimal(str(i["price"]))))
+                
                 # 扣库存
                 for i in items:
                     cur.execute("UPDATE products SET stock=stock-%s WHERE id=%s", (i["quantity"], i["product_id"]))
                 # 清空已选
                 cur.execute("DELETE FROM cart WHERE user_id=%s AND selected=1", (user_id,))
+                
+                # 资金拆分（在同一事务中执行，使用当前游标）
+                split_order_funds(order_number, total, has_vip, cursor=cur)
+                
+                # 提交事务（包含订单创建和资金拆分）
                 conn.commit()
-                split_order_funds(order_number, total, has_vip)
                 return order_number
 
     @staticmethod
