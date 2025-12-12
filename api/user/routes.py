@@ -450,43 +450,10 @@ def set_level(body: SetLevelReq):
 def user_info(mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # 动态检查表结构
-            cur.execute("SHOW COLUMNS FROM users")
-            columns = {row["Field"] for row in cur.fetchall()}
-            
-            # 动态构造 SELECT 字段
-            select_fields = ["id", "mobile", "name", "member_level", "referral_code"]
-            if "avatar_path" in columns:
-                select_fields.append("avatar_path")
-            else:
-                select_fields.append("NULL AS avatar_path")
-            
-            # 动态构造 WHERE 条件（兼容缺少 status 字段的老表）
-            where_clause = "WHERE mobile=%s"
-            params = [mobile]
-            if "status" in columns:
-                where_clause += " AND status != %s"
-                params.append(UserStatus.DELETED.value)
-            
-            # 使用动态表访问构造查询
-            structure = get_table_structure(cur, "users")
-            # 处理资产字段
-            final_select_fields = []
-            for field in select_fields:
-                if field in structure['fields']:
-                    if field in structure['asset_fields']:
-                        final_select_fields.append(f"COALESCE({field}, 0) AS {field}")
-                    else:
-                        final_select_fields.append(field)
-                elif "NULL AS" in field or "AS" in field:
-                    # 已经是别名字段，直接使用
-                    final_select_fields.append(field)
-                else:
-                    final_select_fields.append(field)
-            
             cur.execute(
-                f"SELECT {', '.join(final_select_fields)} FROM users {where_clause}",
-                tuple(params)
+                "SELECT id, mobile, name, avatar_path, member_level, referral_code "
+                "FROM users WHERE mobile=%s AND status != %s",
+                (mobile, UserStatus.DELETED.value)
             )
             u = cur.fetchone()
             if not u:
@@ -522,29 +489,18 @@ def user_info(mobile: str):
             )
             team_total = cur.fetchone()["c"]
 
-            # 动态构造资产字段查询（兼容缺少字段的老表，默认值为 0）
-            structure = get_table_structure(cur, "users")
-            asset_fields_to_select = ["member_points", "merchant_points", "withdrawable_balance"]
-            select_fields = []
-            for field in asset_fields_to_select:
-                if field in structure['fields']:
-                    if field in structure['asset_fields']:
-                        select_fields.append(f"COALESCE({field}, 0) AS {field}")
-                    else:
-                        select_fields.append(field)
-                else:
-                    # 字段不存在，使用默认值
-                    select_fields.append(f"0 AS {field}")
-            
-            select_sql = f"SELECT {', '.join(select_fields)} FROM users WHERE id=%s"
-            cur.execute(select_sql, (u["id"],))
+            cur.execute(
+                "SELECT member_points, merchant_points, withdrawable_balance "
+                "FROM users WHERE id=%s",
+                (u["id"],)
+            )
             assets = cur.fetchone()
 
     return UserInfoResp(
         uid=u["id"],
         mobile=u["mobile"],
         name=u["name"],
-        avatar_path=u.get("avatar_path"),
+        avatar_path=u["avatar_path"],
         member_level=u["member_level"],
         referral_code=u["referral_code"],
         direct_count=direct_count,
@@ -801,13 +757,7 @@ def set_default_addr(addr_id: int, mobile: str):
 def delete_addr(addr_id: int, mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            select_sql = build_dynamic_select(
-                cur,
-                "addresses",
-                where_clause="id=%s",
-                select_fields=["user_id"]
-            )
-            cur.execute(select_sql, (addr_id,))
+            cur.execute("SELECT user_id FROM addresses WHERE id=%s", (addr_id,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="地址不存在")
@@ -822,7 +772,7 @@ def delete_addr(addr_id: int, mobile: str):
             if not u or u["id"] != row["user_id"]:
                 raise HTTPException(status_code=403, detail="地址不属于当前用户")
 
-            cur.execute("DELETE FROM addresses WHERE id=%s", (addr_id,))
+            cur.execute("DELETE FROM user_addresses WHERE id=%s", (addr_id,))
             conn.commit()
     return {"msg": "ok"}
 
@@ -861,10 +811,18 @@ def return_addr_set(body: AddressReq):
 
             # 检查是否存在 is_merchant 字段并判断是否为商家
             cur.execute("SHOW COLUMNS FROM users LIKE 'is_merchant'")
-            if not cur.fetchone() or u.get("is_merchant") != 1:
+            col = cur.fetchone()
+            if not col:
+                # 表中没有 is_merchant 字段，视为未被授予商户身份
                 raise HTTPException(status_code=404, detail="商家不存在或未被授予商户身份")
 
-            user_id = u["id"]
+            # 读取用户的 is_merchant 字段以确认身份
+            cur.execute("SELECT id, is_merchant FROM users WHERE mobile=%s", (body.mobile,))
+            u2 = cur.fetchone()
+            if not u2 or u2.get("is_merchant") != 1:
+                raise HTTPException(status_code=404, detail="商家不存在或未被授予商户身份")
+
+            user_id = u2["id"]
 
             # 2. 嗅探真实字段
             cur.execute("SHOW COLUMNS FROM user_addresses")
@@ -894,10 +852,16 @@ def return_addr_set(body: AddressReq):
                 raise RuntimeError("user_addresses 表无可用字段，请检查表结构")
 
             # 5. 把该商家其他退货地址取消默认
-            cur.execute(
-                "UPDATE user_addresses SET is_default=0 WHERE user_id=%s AND addr_type='return'",
-                (user_id,)
-            )
+            if "addr_type" in cols:
+                cur.execute(
+                    "UPDATE user_addresses SET is_default=0 WHERE user_id=%s AND addr_type='return'",
+                    (user_id,)
+                )
+            else:
+                cur.execute(
+                    "UPDATE user_addresses SET is_default=0 WHERE user_id=%s",
+                    (user_id,)
+                )
 
             # 6. 插入新退货地址
             sql_cols = ",".join(insert_data.keys())
@@ -954,36 +918,11 @@ def points(body: PointsReq):
 def points_balance(mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # 动态检查表结构
-            cur.execute("SHOW COLUMNS FROM users")
-            columns = {row["Field"] for row in cur.fetchall()}
-            
-            # 动态构造资产字段查询（兼容缺少字段的老表，默认值为 0）
-            asset_fields = []
-            asset_defaults = {
-                "member_points": 0,
-                "merchant_points": 0,
-                "withdrawable_balance": 0
-            }
-            for field in asset_defaults.keys():
-                if field in columns:
-                    asset_fields.append(field)
-                else:
-                    asset_fields.append(f"{asset_defaults[field]} AS {field}")
-            
-            cur.execute(
-                f"SELECT {', '.join(asset_fields)} FROM users WHERE mobile=%s",
-                (mobile,)
-            )
+            cur.execute("SELECT member_points, merchant_points, withdrawable_balance FROM users WHERE mobile=%s", (mobile,))
             row = cur.fetchone()
             if not row:
                 _err("用户不存在")
-            # 确保返回的字段都有默认值
-            return {
-                "member_points": row.get("member_points", 0) or 0,
-                "merchant_points": row.get("merchant_points", 0) or 0,
-                "withdrawable_balance": row.get("withdrawable_balance", 0) or 0
-            }
+            return row
 
 @router.get("/points/log", summary="积分流水")
 def points_log(mobile: str, points_type: str = "member", page: int = 1, size: int = 10):
