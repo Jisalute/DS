@@ -6,6 +6,7 @@ from pathlib import Path
 import uvicorn
 import pymysql
 from fastapi import FastAPI
+from core.json_response import DecimalJSONResponse, register_exception_handlers
 from fastapi.staticfiles import StaticFiles
 from core.middleware import setup_cors, setup_static_files
 from core.config import get_db_config, PIC_PATH
@@ -54,8 +55,11 @@ app = FastAPI(
     version="1.0.0",
     docs_url="/docs",  # Swagger UI 文档地址
     redoc_url="/redoc",  # ReDoc 文档地址
-    openapi_url="/openapi.json"  # OpenAPI Schema 地址
+    openapi_url="/openapi.json",  # OpenAPI Schema 地址
+    default_response_class=DecimalJSONResponse
 )
+# 注册全局异常处理器（放在 core/json_response.py 中实现）
+register_exception_handlers(app)
 
 # 定义 OpenAPI Tags 元数据，用于在 Swagger UI 中更好地组织接口
 tags_metadata = [

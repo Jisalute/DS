@@ -166,9 +166,13 @@ class WechatService:
     @staticmethod
     def generate_token(user_id: int) -> str:
         """生成JWT token"""
+        # 确保 payload 中不包含 Decimal 或其他不可序列化对象
+        uid = int(user_id)
+        exp_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
+        exp_ts = int(exp_dt.timestamp())
         payload = {
-            "user_id": user_id,
-            "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
+            "user_id": uid,
+            "exp": exp_ts
         }
         token = jwt.encode(payload, "your_secret_key", algorithm="HS256")
         return token

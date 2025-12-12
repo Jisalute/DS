@@ -1122,5 +1122,6 @@ async def wechat_login(request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"微信登录失败: {e}")
-        raise HTTPException(status_code=500, detail=f"微信登录失败: {e}")
+        logger.exception("微信登录失败")
+        # 为避免将原始异常（可能包含 Decimal 等不可序列化对象）放入响应，返回简单错误信息
+        raise HTTPException(status_code=500, detail="微信登录失败")
