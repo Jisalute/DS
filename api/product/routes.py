@@ -429,6 +429,7 @@ def update_product(id: int, payload: ProductUpdate):
                 if not product:
                     raise HTTPException(status_code=404, detail="商品不存在")
 
+                
                 # 构建更新字段
                 update_fields = []
                 update_params = []
@@ -530,12 +531,35 @@ def upload_images(
                 if not product:
                     raise HTTPException(status_code=404, detail="商品不存在")
 
+                # 初始化 detail_urls：若数据库中已有详情图则使用，否则设为 []
+                raw_detail = product.get('detail_images')
+                try:
+                    if raw_detail:
+                        if isinstance(raw_detail, str):
+                            detail_urls = json.loads(raw_detail)
+                        elif isinstance(raw_detail, list):
+                            detail_urls = raw_detail
+                        else:
+                            detail_urls = []
+                    else:
+                        detail_urls = []
+                except Exception:
+                    detail_urls = []
+
+                # 初始化 banner_urls：从 banner 表中读取现有轮播图（status=1），为空则为 []
+                cur.execute("""
+                    SELECT image_url FROM banner
+                    WHERE product_id = %s AND status = 1
+                    ORDER BY sort_order
+                """, (id,))
+                rows = cur.fetchall()
+                banner_urls = [r['image_url'] for r in rows] if rows else []
+
                 category = product['category']
                 cat_path = BASE_PIC_DIR / category
                 goods_path = cat_path / str(id)
                 goods_path.mkdir(parents=True, exist_ok=True)
 
-                detail_urls = []
                 if detail_images:
                     if len(detail_images) > 10:
                         raise HTTPException(status_code=400, detail="详情图最多10张")
@@ -557,7 +581,6 @@ def upload_images(
                     cur.execute("UPDATE products SET detail_images = %s WHERE id = %s",
                                 (json.dumps(detail_urls, ensure_ascii=False), id))
 
-                banner_urls = []
                 if banner_images:
                     if len(banner_images) > 10:
                         raise HTTPException(status_code=400, detail="轮播图最多10张")
