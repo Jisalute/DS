@@ -705,7 +705,7 @@ def upload_images(
                     # 更新商品主图
                     if banner_urls:
                         cur.execute("UPDATE products SET main_image = %s WHERE id = %s",
-                                    (banner_urls[0], id))
+                                    (json.dumps(banner_urls, ensure_ascii=False), id))
 
                 conn.commit()
 
