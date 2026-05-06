@@ -134,20 +134,12 @@ def execute_insert(sql: str, params: Optional[tuple] = None) -> int:
 
 def execute_transaction(operations: list) -> bool:
     """
-    执行事务操作（多个 SQL 操作）
-    
-    Args:
-        operations: 操作列表，每个元素是 (sql, params) 元组
-    
-    Returns:
-        是否成功
+    执行事务操作（多个 SQL 操作）。
+    失败时记录完整异常并向上抛出（不再静默返回 False）。
     """
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                for sql, params in operations:
-                    cur.execute(sql, params)
-                conn.commit()
-                return True
-    except Exception:
-        return False
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for sql, params in operations:
+                cur.execute(sql, params)
+            conn.commit()
+            return True

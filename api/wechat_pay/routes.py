@@ -1,7 +1,7 @@
 # api/wechat_pay/routes.py
 from fastapi import APIRouter, Request, HTTPException, Response
 from core.wx_pay_client import WeChatPayClient
-from core.config import ENVIRONMENT, WECHAT_PAY_API_V3_KEY, POINTS_DISCOUNT_RATE
+from core.config import WECHAT_PAY_API_V3_KEY, POINTS_DISCOUNT_RATE
 from core.response import success_response
 from core.database import get_conn
 from services.finance_service import (
@@ -18,7 +18,9 @@ import uuid
 import json
 import logging
 import base64
+import pymysql
 from core.config import settings
+from core.payment_amounts import prepay_fee_cents_authoritative
 import xml.etree.ElementTree as ET  # 用于生成XML响应
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -31,7 +33,7 @@ pay_client = WeChatPayClient()
 @router.post("/create-order", summary="创建JSAPI订单并返回前端支付参数")
 async def create_jsapi_order(request: Request):
     """创建 JSAPI 订单并返回前端调用 `wx.requestPayment`/小程序支付所需参数。
-    请求 JSON：out_trade_no/order_id, total_fee(分), openid, description(可选)；
+    请求 JSON：out_trade_no/order_id, total_fee(分，须与服务端应付一致), openid, description(可选)；
     coupon_ids(可选,多张券ID数组) 或 coupon_id(可选,单张)；points_to_use(可选)
     """
     try:
@@ -181,19 +183,16 @@ async def create_jsapi_order(request: Request):
                         "paySign": "ZERO_ORDER_SIGN",
                     }
 
-                # 客户端 total_fee（分）可低于服务端计算：与微信实付必须一致，故落库 total_amount 须同步
-                final_cents = payable_cents
+                # 应付金额仅以服务端计算为准（禁止采用客户端较小金额，防止少付）
+                final_cents = prepay_fee_cents_authoritative(
+                    server_payable_cents=payable_cents,
+                    client_fee_cents=total_fee_client_int,
+                )
                 if total_fee_client_int != payable_cents:
                     logger.warning(
-                        "订单支付金额校正: client=%s, server=%s, order=%s",
+                        "订单支付金额与客户端不一致（已以服务端为准）: client=%s, server=%s, order=%s",
                         total_fee_client, payable_cents, out_trade_no,
                     )
-                    if 0 < total_fee_client_int < payable_cents:
-                        logger.info(
-                            "使用客户端金额作为应付金额: client=%s, server=%s, order=%s",
-                            total_fee_client_int, payable_cents, out_trade_no,
-                        )
-                        final_cents = total_fee_client_int
 
                 charge_yuan = (Decimal(final_cents) / Decimal(100)).quantize(Decimal('0.01'))
                 stored_total = Decimal(str(order_row.get('total_amount') or 0)).quantize(Decimal('0.01'))
@@ -296,28 +295,14 @@ async def wechat_pay_notify(request: Request):
 
         headers = request.headers
 
-        # 验证签名头
+        # 验证签名头（禁止 HTTP 头绕过；本地联调请使用 WX_MOCK_MODE + 明文 resource，见下方解密分支）
         signature = headers.get("Wechatpay-Signature")
         timestamp = headers.get("Wechatpay-Timestamp")
         nonce = headers.get("Wechatpay-Nonce")
         serial = headers.get("Wechatpay-Serial")
 
-        # 开发绕过：允许在非 production 环境下通过自定义头跳过签名校验（仅用于本地/测试）
-        bypass_header = headers.get("X-DEV-BYPASS-VERIFY") or headers.get("X-DEV-BYPASS")
-        # 支持基于共享测试令牌的绕过（在 systemd/.env 中设置 TEST_NOTIFY_TOKEN）
-        test_token_header = headers.get("X-DEV-TEST-TOKEN")
-        test_token_env = None
-        try:
-            import os
-
-            test_token_env = os.getenv("TEST_NOTIFY_TOKEN")
-        except Exception:
-            test_token_env = None
-
-        if (bypass_header and ENVIRONMENT != "production") or (
-            test_token_header and test_token_env and test_token_header == test_token_env
-        ):
-            logger.warning("开发模式：绕过回调签名校验（开发头或测试令牌触发）")
+        if pay_client.mock_mode:
+            logger.info("【MOCK】微信支付回调：跳过签名校验（由 WX_MOCK_MODE 控制）")
         else:
             if not all([signature, timestamp, nonce, serial]):
                 logger.error("缺少必要的回调头信息")
@@ -330,10 +315,6 @@ async def wechat_pay_notify(request: Request):
             except Exception as e:
                 logger.error(f"签名验证异常: {str(e)}")
                 return _xml_response("FAIL", f"Signature error: {str(e)}")
-
-        # 支持开发调试绕过签名验证（兼容性备用头）
-        if headers.get("X-Bypass-Signature", "").lower() == "true" and ENVIRONMENT != "production":
-            logger.warning("开发模式：跳过签名验证 (X-Bypass-Signature)")
 
         # 解析回调数据（真实微信通知是JSON，部分测试可能使用XML包装）
         content_type = headers.get("content-type", "")
@@ -359,13 +340,11 @@ async def wechat_pay_notify(request: Request):
             logger.error("回调数据中缺少resource字段")
             return _xml_response("FAIL", "Missing resource")
 
-        # 开发绕过：若请求头包含 X-DEV-PLAIN-BODY，则认为 resource 已是明文 JSON（跳过 decrypt）
-        plain_header = headers.get("X-DEV-PLAIN-BODY") or headers.get("X-DEV-PLAIN")
-
-        # 检查 resource 是否具备解密所需字段
+        # 检查 resource 是否具备解密所需字段（非 MOCK 时必须为微信密文包）
         required_fields = ("ciphertext", "nonce", "associated_data")
         missing_fields = [f for f in required_fields if f not in resource]
-        if missing_fields and not (plain_header and ENVIRONMENT != "production"):
+        mock_plain = pay_client.mock_mode and not (resource.get("ciphertext") or "").strip()
+        if missing_fields and not mock_plain:
             logger.error(f"回调 resource 缺少必要字段 {missing_fields}; content={resource}")
             return _xml_response("FAIL", f"Missing resource fields: {','.join(missing_fields)}")
 
@@ -381,9 +360,9 @@ async def wechat_pay_notify(request: Request):
         except Exception:
             logger.debug("记录 resource 明细失败", exc_info=True)
 
-        if plain_header and ENVIRONMENT != "production":
-            logger.info("开发模式：跳过回调解密，直接使用明文 resource（X-DEV-PLAIN-BODY detected）")
-            decrypted_data = resource
+        if mock_plain:
+            logger.info("【MOCK】跳过回调解密，直接使用明文 resource（需 WX_MOCK_MODE=true）")
+            decrypted_data = resource if isinstance(resource, dict) else {}
         else:
             # 按官方示例执行 AESGCM 解密
             try:
@@ -813,6 +792,22 @@ async def _handle_online_pay_success(order_no: str, transaction_id: str, amount:
                 order = cur.fetchone()
                 if not order:
                     raise ValueError("订单号不存在")
+
+                tid_existing = order.get("transaction_id")
+                if tid_existing:
+                    if str(tid_existing) != str(transaction_id):
+                        raise ValueError(
+                            f"订单已绑定其他微信交易号: 已有={tid_existing}, 回调={transaction_id}"
+                        )
+                    if order.get("status") != "pending_pay":
+                        logger.info(
+                            "微信支付回调幂等: 订单=%s 已处理 status=%s transaction_id=%s",
+                            order_no,
+                            order.get("status"),
+                            transaction_id,
+                        )
+                        return
+
                 if order.get('status') != 'pending_pay':
                     logger.info(f"订单 {order_no} 状态为 {order.get('status')}，已处理，忽略")
                     return
@@ -906,7 +901,16 @@ async def _handle_online_pay_success(order_no: str, transaction_id: str, amount:
                 # 终端状态已由 settle_order/_settle_order_internal 写入（全虚拟→completed，否则 pending_ship/pending_recv）
                 # 切勿在此处再次 update_status，否则会覆盖虚拟订单的 completed，造成「已到账仍显示待收货」等问题
 
-                conn.commit()
+                try:
+                    conn.commit()
+                except pymysql.err.IntegrityError as ie:
+                    conn.rollback()
+                    logger.error(
+                        "线上支付回调提交失败（唯一约束，常见为 transaction_id 与其它订单冲突）: order=%s err=%s",
+                        order_no,
+                        ie,
+                    )
+                    raise ValueError("transaction_id 唯一约束冲突，需人工对账") from ie
         logger.info(f"线上订单支付成功: {order_no}")
         if order.get("delivery_way") == "pickup":
             import asyncio

@@ -112,6 +112,10 @@ class Settings(BaseSettings):
     PUSH_TEMPLATE_ID_APPLYMENT: str = ""
     ENVIRONMENT: str = "development"
 
+    # 浏览器跨域：逗号分隔的完整 Origin（含协议与端口），如 https://app.example.com,https://admin.example.com
+    # 生产环境必填；开发/测试若留空则使用 core.middleware 内置的本地默认列表
+    CORS_ALLOW_ORIGINS: str = ""
+
 # 实例化设置
 settings = Settings()
 

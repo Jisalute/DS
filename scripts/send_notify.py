@@ -3,13 +3,13 @@
 scripts/send_notify.py
 
 签名并发送模拟微信回调（用于开发/测试）。
-支持两种模式：
- - 使用商户私钥生成真实 RSA-SHA256 签名（提供 --key）
- - 使用伪造签名并通过开发头绕过（--bypass）
+ - 使用商户私钥生成真实 RSA-SHA256 签名（提供 --key），推荐。
+ - 明文 resource（无 ciphertext）：须在服务端设置 WX_MOCK_MODE=true，不再支持 HTTP 头绕过验签。
 
 用法示例:
   uv run scripts/send_notify.py --url http://127.0.0.1:5231/wechat-pay/notify --key ./certs/apiclient_key.pem
-  uv run scripts/send_notify.py --url http://127.0.0.1:5231/wechat-pay/notify --bypass --plain
+  # 明文 resource（需服务端 WX_MOCK_MODE=true）:
+  uv run scripts/send_notify.py --url http://127.0.0.1:5231/wechat-pay/notify --plain
 
 注意：私钥文件只能放在受控后端环境，切勿上传到前端。
 """
@@ -29,7 +29,7 @@ project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from core.config import ENVIRONMENT, WECHAT_PAY_API_V3_KEY, WX_APIV3_KEY
+from core.config import WECHAT_PAY_API_V3_KEY, WX_APIV3_KEY
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 try:
@@ -70,9 +70,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:5231/wechat-pay/notify", help="回调地址")
     parser.add_argument("--key", default=None, help="商户私钥 PEM 文件路径（可选，用于真实签名）")
-    parser.add_argument("--bypass", action="store_true", help="在开发环境绕过签名校验（发送 X-DEV-BYPASS-VERIFY）")
-    parser.add_argument("--plain", action="store_true", help="表示 resource 为明文（发送 X-DEV-PLAIN-BODY）")
-    parser.add_argument("--test-token", default=None, help="发送 X-DEV-TEST-TOKEN 用于受控绕过")
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="resource 为明文 JSON（无 ciphertext）；服务端须 WX_MOCK_MODE=true",
+    )
     parser.add_argument("--event", default="TRANSACTION.SUCCESS")
     parser.add_argument("--out", default="TEST123456")
     parser.add_argument("--encrypt", action="store_true", help="使用 WECHAT_PAY_API_V3_KEY 加密 resource（用于测试 decrypt_callback_data）")
@@ -110,6 +112,9 @@ def main():
         # Use ASCII-safe JSON to avoid any encoding ambiguity when posting
         body_str = json.dumps(payload, ensure_ascii=True)
 
+    if args.plain and not args.encrypt:
+        print("提示: 明文 resource 回调需要 API 进程启用 WX_MOCK_MODE=true")
+
     ts = str(int(time.time()))
     nonce = uuid.uuid4().hex
 
@@ -120,7 +125,7 @@ def main():
         "Wechatpay-Serial": "TEST_SERIAL",
     }
 
-    # 生成签名或使用伪造签名
+    # 生成签名或使用伪造签名（非 MOCK 模式下须 --key 提供合法签名）
     if args.key:
         if serialization is None:
             print("cryptography 未安装，无法使用私钥签名")
@@ -130,25 +135,10 @@ def main():
     else:
         headers["Wechatpay-Signature"] = "MOCK_SIGNATURE_BASE64"
 
-    if args.bypass:
-        headers["X-DEV-BYPASS-VERIFY"] = "1"
-    if args.plain:
-        headers["X-DEV-PLAIN-BODY"] = "1"
-    if args.test_token:
-        headers["X-DEV-TEST-TOKEN"] = args.test_token
-
     print("POST", args.url)
     print("Headers:", {k: headers[k] for k in ["Wechatpay-Timestamp", "Wechatpay-Nonce", "Wechatpay-Signature"]})
-    if args.bypass:
-        print("Dev bypass header included")
 
     try:
-        if ENVIRONMENT == 'production' and (args.bypass or args.plain):
-            print("警告：当前 ENVIRONMENT=production，禁止使用绕过选项。取消绕过。")
-            headers.pop("X-DEV-BYPASS-VERIFY", None)
-            headers.pop("X-DEV-PLAIN-BODY", None)
-        # (removed detailed debug body print)
-
         resp = requests.post(args.url, data=body_str.encode('utf-8'), headers=headers, timeout=10, verify=False)
         print("Response:", resp.status_code)
         print(resp.text)

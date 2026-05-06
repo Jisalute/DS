@@ -6,7 +6,7 @@
 
 import logging
 import json
-from decimal import Decimal, ROUND_DOWN, ROUND_CEILING
+from decimal import Decimal, ROUND_DOWN, ROUND_CEILING, ROUND_FLOOR
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 import time
@@ -27,6 +27,9 @@ from core.table_access import build_dynamic_select, get_table_structure, _quote_
 from core.db_adapter import build_in_placeholders
 
 logger = get_logger(__name__)
+
+# 各子资金池 allocation 配置之和的基准（默认 0.20）；实际划出比例由 get_distribution_platform_rate() 决定并按此基准缩放
+NOMINAL_SUBPOOL_SLICE = Decimal("0.20")
 
 
 def max_coupon_total_yuan(merchandise_total: Decimal, points_discount: Decimal) -> Decimal:
@@ -116,6 +119,81 @@ def parse_offline_coupon_ids(order_row: dict) -> list[int]:
 
 
 class FinanceService:
+    def get_distribution_platform_rate(self) -> Decimal:
+        """平台从分账基数（实付+券，即原价−积分抵扣）上计提的比例，默认 0.20。
+
+        用于：① 各子资金池划出金额 = 基数 × 各池 allocation × (rate/0.20)；
+        ② 公司积分池入账 = 基数 × rate。
+        持久化在 finance_accounts.platform_revenue_pool.config_params.distribution_platform_rate。
+        """
+        default = NOMINAL_SUBPOOL_SLICE
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT config_params FROM finance_accounts WHERE account_type = %s LIMIT 1",
+                        ("platform_revenue_pool",),
+                    )
+                    row = cur.fetchone()
+                    if not row or not row.get("config_params"):
+                        return default
+                    cp = row["config_params"]
+                    if isinstance(cp, str):
+                        parsed = json.loads(cp)
+                    else:
+                        parsed = cp or {}
+                    if not isinstance(parsed, dict):
+                        return default
+                    raw = parsed.get("distribution_platform_rate")
+                    if raw is None or raw == "":
+                        return default
+                    d = Decimal(str(raw)).quantize(Decimal("0.000001"))
+                    if d <= Decimal("0") or d > Decimal("1"):
+                        logger.warning(
+                            "distribution_platform_rate 非法(%s)，回退默认 0.20", raw
+                        )
+                        return default
+                    return d
+        except Exception as e:
+            logger.debug("读取 distribution_platform_rate 失败，使用默认 0.20: %s", e)
+            return default
+
+    def set_distribution_platform_rate(self, rate: Decimal) -> Decimal:
+        """手动设置平台计提比例（相对分账基数）。合法范围 (0, 1]，建议不超过 0.5。"""
+        d = Decimal(str(rate)).quantize(Decimal("0.000001"))
+        if d <= Decimal("0") or d > Decimal("1"):
+            raise ValueError("distribution_platform_rate 须在 (0, 1] 之间")
+        if d > Decimal("0.5"):
+            raise ValueError("distribution_platform_rate 超过 0.5 未允许，如需更高请联系开发调整上限")
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, config_params FROM finance_accounts WHERE account_type = %s LIMIT 1",
+                    ("platform_revenue_pool",),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise FinanceException("缺少 platform_revenue_pool 账户行，请先初始化 finance_accounts")
+                cp = row.get("config_params")
+                try:
+                    if isinstance(cp, str):
+                        parsed = json.loads(cp) if cp else {}
+                    else:
+                        parsed = cp or {}
+                    if not isinstance(parsed, dict):
+                        parsed = {}
+                except (TypeError, json.JSONDecodeError):
+                    parsed = {}
+                parsed["distribution_platform_rate"] = str(d)
+                cur.execute(
+                    "UPDATE finance_accounts SET config_params = %s WHERE id = %s",
+                    (json.dumps(parsed, ensure_ascii=False), row["id"]),
+                )
+            conn.commit()
+        logger.info("已更新 distribution_platform_rate=%s", d)
+        return d
+
     def __init__(self, session: Optional[PyMySQLAdapter] = None):
         """
         初始化 FinanceService
@@ -290,7 +368,7 @@ class FinanceService:
                           coupon_discount AS stored_coupon_discount,
                           points_discount AS stored_points_discount,
                           original_amount AS stored_original_amount
-                   FROM orders WHERE order_number = %s""",
+                   FROM orders WHERE order_number = %s FOR UPDATE""",
                 (order_no,),
             )
             order_info = cur.fetchone()
@@ -479,6 +557,12 @@ class FinanceService:
 
             # ==================== 9. 资金分账（始终执行，按实付金额 + 优惠券金额） ====================
             allocs = self.get_pool_allocations()
+            platform_rate = self.get_distribution_platform_rate()
+            subpool_scale = (
+                platform_rate / NOMINAL_SUBPOOL_SLICE
+                if NOMINAL_SUBPOOL_SLICE > 0
+                else Decimal("1")
+            )
 
             # 分账基数 = 实付金额 + 优惠券金额 = 原价 - 积分抵扣
             distribution_base = self._calculate_distribution_base(
@@ -488,6 +572,7 @@ class FinanceService:
             logger.debug(
                 f"[分账基数] 订单{order_no} 使用原价减去积分抵扣作为基数: ¥{distribution_base:.2f} "
                 f"（原价¥{total_amount:.2f}，积分抵扣¥{points_discount:.2f}，优惠券¥{coupon_discount:.2f}，实付¥{final_amount:.2f}）"
+                f"，平台计提比例={platform_rate}（子池缩放×{subpool_scale}）"
             )
 
             # 平台收入池记入 100% 实付现金
@@ -523,19 +608,19 @@ class FinanceService:
                 normal_ratio = Decimal('0')
             normal_paid = distribution_base * normal_ratio
 
-            # 各子池统一分配（从平台收入池扣减）
+            # 各子池统一分配（从平台收入池扣减）；子池合计占基数 platform_rate，相对权重仍由 allocation 决定
             for atype, ratio in allocs.items():
                 if atype == 'merchant_balance':
                     continue
-                alloc_amount = (distribution_base * ratio).quantize(Decimal('0.000001'))
+                alloc_amount = (distribution_base * ratio * subpool_scale).quantize(Decimal('0.000001'))
                 self._add_pool_balance(
                     cur, 'platform_revenue_pool', -alloc_amount,
-                    f"订单分账: {order_no} → {atype} ({ratio * 100:.0f}%)",
+                    f"订单分账: {order_no} → {atype} (配置{ratio * 100:.2f}%×计提{platform_rate * 100:.2f}%)",
                     user_id
                 )
                 if atype == 'fund_pool' and has_referrer and normal_paid > 0:
                     # 计算应给推荐人的金额（基于普通商品部分）
-                    referral_amount = (normal_paid * ratio).quantize(Decimal('0.000001'))
+                    referral_amount = (normal_paid * ratio * subpool_scale).quantize(Decimal('0.000001'))
                     # 发放给推荐人点数
                     self._grant_referral_points(cur, referrer_id, referral_amount, order_no)
                     # 剩余部分进入事业发展基金
@@ -553,20 +638,21 @@ class FinanceService:
                         user_id
                     )
 
-            # 公司积分池独立增加（基于实付金额的20%）
-            company_points_amount = (distribution_base * Decimal('0.20')).quantize(Decimal('0.000001'))
+            # 公司积分池独立增加（与平台计提比例一致，默认 20% 基数）
+            company_points_amount = (distribution_base * platform_rate).quantize(Decimal('0.000001'))
             cur.execute(
                 "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_points'",
                 (company_points_amount,)
             )
             cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'company_points'")
             cp_new_balance = Decimal(str(cur.fetchone()['balance'] or 0))
+            pct_label = str((platform_rate * 100).quantize(Decimal("0.01")))
             cur.execute(
                 """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
                    flow_type, remark, created_at)
                    VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
                 ('company_points', PLATFORM_MERCHANT_ID, company_points_amount, cp_new_balance, 'income',
-                 f"订单#{order_no} 公司积分池+20% ¥{company_points_amount:.4f}")
+                 f"订单#{order_no} 公司积分池+{pct_label}% ¥{company_points_amount:.4f}")
             )
             try:
                 cur.execute(
@@ -3771,16 +3857,16 @@ class FinanceService:
             coupon_type: str = 'user',
             applicable_product_type: str = 'all',
             remark: str = None
-    ) -> int:
+    ) -> List[int]:
         """
-        将指定资金池的金额转化为优惠券赠送给用户
+        将指定资金池的金额转化为多张 1 元优惠券赠送给用户（扣池金额与券面额一致，须为整数元）。
         :param pool_type: 资金池类型（如 'public_welfare'）
         :param user_id: 接收优惠券的用户ID
-        :param amount: 转正金额（正数）
+        :param amount: 转正金额（正数，须为整数元，例如 10 表示发放 10 张 1 元券）
         :param coupon_type: 优惠券类型 'user'/'merchant'
         :param applicable_product_type: 适用商品范围
         :param remark: 操作备注
-        :return: 优惠券ID
+        :return: 优惠券 ID 列表
         """
         allowed_pools = [
             'public_welfare', 'maintain_pool',
@@ -3793,8 +3879,12 @@ class FinanceService:
         if amount <= 0:
             raise FinanceException("转正金额必须大于0")
 
-        from datetime import datetime, timedelta
-        from core.config import COUPON_VALID_DAYS
+        whole_yuan = amount.to_integral_value(rounding=ROUND_FLOOR)
+        if amount != whole_yuan:
+            raise FinanceException("转正金额须为整数元，以便按每张 1 元发放多张优惠券")
+        n = int(whole_yuan)
+        if n < 1:
+            raise FinanceException("转正金额折合张数须至少 1 元")
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -3802,31 +3892,38 @@ class FinanceService:
                 self._add_pool_balance(
                     cur,
                     pool_type,
-                    -amount,
-                    remark or f"资金池转正：将{amount:.4f}转为优惠券赠送给用户{user_id}",
+                    -whole_yuan,
+                    remark or f"资金池转正：将{whole_yuan}元转为{n}张1元优惠券赠送给用户{user_id}",
                     related_user=user_id
                 )
 
-                # 2. 发放优惠券
+                # 2. 发放 n 张 1 元优惠券
                 today = datetime.now().date()
                 valid_to = today + timedelta(days=COUPON_VALID_DAYS)
-                cur.execute("""
-                    INSERT INTO coupons
-                    (user_id, coupon_type, amount, applicable_product_type, valid_from, valid_to, status)
-                    VALUES (%s, %s, %s, %s, %s, %s, 'unused')
-                """, (user_id, coupon_type, amount, applicable_product_type, today, valid_to))
-                coupon_id = cur.lastrowid
+                one = Decimal('1')
+                coupon_ids: List[int] = []
+                for _ in range(n):
+                    cur.execute("""
+                        INSERT INTO coupons
+                        (user_id, coupon_type, amount, applicable_product_type, valid_from, valid_to, status)
+                        VALUES (%s, %s, %s, %s, %s, %s, 'unused')
+                    """, (user_id, coupon_type, one, applicable_product_type, today, valid_to))
+                    coupon_ids.append(cur.lastrowid)
 
                 # 3. 记录优惠券发放流水（便于查询）
+                if n <= 5:
+                    ids_part = ",".join(str(i) for i in coupon_ids)
+                else:
+                    ids_part = f"{coupon_ids[0]}..{coupon_ids[-1]}（共{n}张）"
                 cur.execute("""
                     INSERT INTO account_flow
                     (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
                     VALUES (%s, %s, %s, %s, %s, %s, NOW())
                 """, ('coupon', user_id, Decimal('0'), Decimal('0'), 'info',
-                      f"通过资金池转正获得优惠券#{coupon_id}，金额{amount:.4f}，来源池:{pool_type}"))
+                      f"通过资金池转正获得{n}张1元优惠券（id:{ids_part}），合计¥{whole_yuan}，来源池:{pool_type}"))
 
                 conn.commit()
-                return coupon_id
+                return coupon_ids
 
     def get_transform_logs(
             self,

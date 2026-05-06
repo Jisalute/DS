@@ -598,6 +598,68 @@ class AllocationsRequest(BaseModel):
     allocations: Dict[str, float]
 
 
+class DistributionPlatformRateRequest(BaseModel):
+    """平台从分账基数（实付+优惠券，即商品原价−积分抵扣）上的计提比例，默认 0.20。"""
+
+    rate: float = Field(
+        ...,
+        gt=0,
+        le=1.0,
+        description="例如 0.25 表示基数×25% 划入子池合计与公司积分池（子池间相对权重不变）",
+    )
+
+
+@router.get(
+    "/api/fund-pools/distribution-platform-rate",
+    response_model=ResponseModel,
+    summary="查询平台分账计提比例",
+)
+async def get_distribution_platform_rate(
+    service: FinanceService = Depends(get_finance_service),
+):
+    """读取当前 `distribution_platform_rate`（默认 0.20）。持久化在 platform_revenue_pool.config_params。"""
+    try:
+        r = service.get_distribution_platform_rate()
+        return ResponseModel(
+            success=True,
+            message="ok",
+            data={
+                "distribution_platform_rate": float(r),
+                "nominal_subpool_config_sum": 0.20,
+                "description": "子池划出合计=基数×rate（各子池按原 allocation 占 20% 的权重缩放）；公司积分池入账=基数×rate。线下单商家结算=基数×(1−rate)。",
+            },
+        )
+    except Exception as e:
+        logger.error(f"查询 distribution_platform_rate 失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post(
+    "/api/fund-pools/distribution-platform-rate",
+    response_model=ResponseModel,
+    summary="设置平台分账计提比例",
+)
+async def set_distribution_platform_rate(
+    request: DistributionPlatformRateRequest,
+    service: FinanceService = Depends(get_finance_service),
+):
+    """手动调整计提比例（如 0.20→0.25）。超过 0.5 会被拒绝。"""
+    try:
+        r = service.set_distribution_platform_rate(Decimal(str(request.rate)))
+        return ResponseModel(
+            success=True,
+            message="已更新平台分账计提比例",
+            data={"distribution_platform_rate": float(r)},
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"更新 distribution_platform_rate 失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/api/fund-pools/allocations", response_model=ResponseModel, summary="查询资金池分配配置")
 async def get_pool_allocations(
         service: FinanceService = Depends(get_finance_service)
@@ -1325,14 +1387,14 @@ async def get_all_points_detail_report(
 async def transform_pool_to_coupon(
     pool_type: str = Query(..., description="资金池类型，如 public_welfare"),
     user_id: int = Query(..., gt=0, description="接收优惠券的用户ID"),
-    amount: float = Query(..., gt=0, description="转正金额"),
+    amount: float = Query(..., gt=0, description="转正金额（整数元；每张 1 元，例如 10 发 10 张）"),
     coupon_type: str = Query('user', pattern=r'^(user|merchant)$', description="优惠券类型"),
     applicable_product_type: str = Query('all', pattern=r'^(all|normal_only|member_only)$', description="适用商品范围"),
     remark: Optional[str] = Query(None, description="操作备注"),
     service: FinanceService = Depends(get_finance_service)
 ):
     try:
-        coupon_id = service.transform_pool_to_coupon(
+        coupon_ids = service.transform_pool_to_coupon(
             pool_type=pool_type,
             user_id=user_id,
             amount=Decimal(str(amount)),
@@ -1340,10 +1402,16 @@ async def transform_pool_to_coupon(
             applicable_product_type=applicable_product_type,
             remark=remark
         )
+        n = len(coupon_ids)
         return ResponseModel(
             success=True,
-            message=f"转正成功，已为用户{user_id}发放优惠券#{coupon_id}，金额¥{amount:.2f}",
-            data={"coupon_id": coupon_id}
+            message=f"转正成功，已为用户{user_id}发放{n}张1元优惠券，合计¥{amount:.0f}",
+            data={
+                "coupon_ids": coupon_ids,
+                "count": n,
+                "amount_per_coupon": 1.0,
+                "total_amount": float(amount),
+            },
         )
     except FinanceException as e:
         raise HTTPException(status_code=400, detail=str(e))

@@ -15,6 +15,7 @@ from core.middleware import setup_cors, setup_static_files
 from core.config import get_db_config, PIC_PATH, AVATAR_UPLOAD_DIR,UVICORN_PORT
 from core.logging import setup_logging
 from database_setup import initialize_database
+from core.startup_checks import validate_production_safety
 from api.wechat_pay.routes import register_wechat_pay_routes
 from api.wechat_wxa.routes import register_wechat_wxa_routes
 from core.logging import get_logger
@@ -83,6 +84,11 @@ register_exception_handlers(app)
 def on_startup():
     logger.info("=" * 50)
     logger.info("应用启动：检查并初始化数据库表结构与后台任务")
+    try:
+        validate_production_safety()
+    except RuntimeError as e:
+        logger.critical("启动配置校验失败: %s", e)
+        raise
     try:
         initialize_database()
         logger.info("数据库表结构初始化完成")

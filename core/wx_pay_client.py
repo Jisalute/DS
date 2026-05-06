@@ -812,15 +812,6 @@ class WeChatPayClient:
             except Exception:
                 sig = signature
 
-            # 测试/调试兼容：某些测试回调会带 MOCK_SIGNATURE（非 base64）
-            # 在 Mock 模式或非生产环境下允许通过以便测试流程
-            try:
-                if sig and sig.upper().startswith('MOCK') and (self.mock_mode or ENVIRONMENT != 'production'):
-                    logger.warning(f"检测到测试签名，跳过严格验证: {sig}")
-                    return True
-            except Exception:
-                pass
-
             # 先尝试直接解码；若失败，尝试 URL 解码后再解码
             try:
                 signature_bytes = base64.b64decode(sig)
