@@ -135,6 +135,30 @@ class OrderManager:
         return ", ".join(select_parts)
 
     @staticmethod
+    def _shipping_address_line(order: Dict[str, Any]) -> tuple[bool, Optional[str]]:
+        """
+        是否按「发货/配送」展示收货信息；自提订单不展示拼接后的详细地址串。
+        返回 (show_detailed_address, detailed_address_line)。
+        """
+        dw = (order.get("delivery_way") or "platform")
+        if isinstance(dw, str):
+            dw = dw.strip().lower()
+        else:
+            dw = str(dw).strip().lower() if dw is not None else "platform"
+        if dw == "pickup":
+            return False, None
+        parts: List[str] = []
+        for key in ("province", "city", "district"):
+            v = order.get(key)
+            if v is not None and str(v).strip():
+                parts.append(str(v).strip())
+        street = order.get("shipping_address")
+        if street is not None and str(street).strip():
+            parts.append(str(street).strip())
+        line = "".join(parts) if parts else None
+        return True, (line or None)
+
+    @staticmethod
     def create(
             user_id: int,
             address_id: Optional[int],
@@ -498,7 +522,7 @@ class OrderManager:
                 for o in orders:
                     cur.execute(
                         """
-                        SELECT oi.*, p.name
+                        SELECT oi.*, p.name AS product_name
                         FROM order_items oi
                         JOIN products p ON oi.product_id = p.id
                         WHERE oi.order_id = %s
@@ -668,6 +692,7 @@ class OrderManager:
                 pending_coupon_id = order.get("pending_coupon_id")
                 # ======================================
 
+                show_detailed_address, detailed_address_line = OrderManager._shipping_address_line(order)
                 address = {
                     "consignee_name": order.get("consignee_name"),
                     "consignee_phone": order.get("consignee_phone"),
@@ -675,6 +700,9 @@ class OrderManager:
                     "city": order.get("city"),
                     "district": order.get("district"),
                     "detail": order.get("shipping_address"),
+                    # 订单页：姓名/电话沿用 consignee_*；以下为「需发货/配送」时才应展示的完整详细地址
+                    "detailed_address": detailed_address_line if show_detailed_address else None,
+                    "show_detailed_address": show_detailed_address,
                 }
 
                 return {

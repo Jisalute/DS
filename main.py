@@ -68,7 +68,8 @@ app = FastAPI(
     title="禹泽数字科技综合管理系统API",
     description="本网站为企业综合管理系统接口服务平台，用于提供用户管理、订单管理、商品管理及数据统计等系统功能。",
     version="1.0.0",
-    docs_url="/docs",  # 自定义 docs 路由以支持搜索过滤
+    # 必须为 None：否则内置 /docs 会先注册，自定义备案页永远不会被匹配到
+    docs_url=None,
     redoc_url="/redoc",  # ReDoc 文档地址
     openapi_url="/openapi.json",  # OpenAPI Schema 地址
     default_response_class=DecimalJSONResponse
@@ -268,7 +269,9 @@ async def custom_swagger_ui_html():
         swagger_html = get_swagger_ui_html(
             openapi_url=app.openapi_url,
             title=f"{app.title} - Swagger UI",
-            swagger_ui_parameters={"filter": True}
+            oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
+            init_oauth=app.swagger_ui_init_oauth,
+            swagger_ui_parameters=app.swagger_ui_parameters,
         )
         # 确保 body 存在
         if not swagger_html.body:
@@ -280,7 +283,9 @@ async def custom_swagger_ui_html():
         return get_swagger_ui_html(
             openapi_url=app.openapi_url,
             title=f"{app.title} - Swagger UI",
-            swagger_ui_parameters={"filter": True}
+            oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
+            init_oauth=app.swagger_ui_init_oauth,
+            swagger_ui_parameters=app.swagger_ui_parameters,
         )
 
     beian_html = """

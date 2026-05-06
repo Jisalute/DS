@@ -903,10 +903,8 @@ async def _handle_online_pay_success(order_no: str, transaction_id: str, amount:
                     external_conn=conn
                 )
 
-                # 更新订单状态
-                next_status = "pending_recv" if order.get('delivery_way') == 'pickup' else "pending_ship"
-                from api.order.order import OrderManager
-                OrderManager.update_status(order_no, next_status, external_conn=conn)
+                # 终端状态已由 settle_order/_settle_order_internal 写入（全虚拟→completed，否则 pending_ship/pending_recv）
+                # 切勿在此处再次 update_status，否则会覆盖虚拟订单的 completed，造成「已到账仍显示待收货」等问题
 
                 conn.commit()
         logger.info(f"线上订单支付成功: {order_no}")

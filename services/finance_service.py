@@ -596,7 +596,7 @@ class FinanceService:
 
             # 商品奖励发放
             cur.execute("""
-                SELECT p.reward_rain, p.reward_points
+                SELECT oi.quantity, p.reward_rain, p.reward_points
                 FROM order_items oi
                 JOIN products p ON oi.product_id = p.id
                 WHERE oi.order_id = %s
@@ -606,8 +606,9 @@ class FinanceService:
                 total_rain = Decimal('0')
                 total_points = Decimal('0')
                 for item in reward_items:
-                    total_rain += Decimal(str(item.get('reward_rain', 0) or 0))
-                    total_points += Decimal(str(item.get('reward_points', 0) or 0))
+                    qty = Decimal(str(item['quantity']))
+                    total_rain += Decimal(str(item.get('reward_rain', 0) or 0)) * qty
+                    total_points += Decimal(str(item.get('reward_points', 0) or 0)) * qty
 
                 if total_rain > 0:
                     cur.execute(
@@ -951,7 +952,7 @@ class FinanceService:
                 referrer_level = referrer_info['member_level'] if referrer_info else 0
 
                 if referrer_level >= 1:
-                    reward_amount = single_price * Decimal('0.50')
+                    reward_amount = single_price * Decimal('0.30')
 
                     # 发放到 referral_points
                     cur.execute(
@@ -1725,7 +1726,7 @@ class FinanceService:
                 )
                 referrer = result.fetchone()
                 if referrer and referrer.referrer_id:
-                    reward_amount = Decimal(str(order.original_amount)) * Decimal('0.50')
+                    reward_amount = Decimal(str(order.original_amount)) * Decimal('0.30')
                     self.session.execute(
                         """UPDATE users SET promotion_balance = promotion_balance - %s
                            WHERE id = %s AND promotion_balance >= %s""",
