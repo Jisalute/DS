@@ -112,6 +112,10 @@ class Settings(BaseSettings):
     PUSH_TEMPLATE_ID_APPLYMENT: str = ""
     ENVIRONMENT: str = "development"
 
+    # 浏览器跨域：逗号分隔的完整 Origin（含协议与端口），如 https://app.example.com,https://admin.example.com
+    # 生产环境必填；开发/测试若留空则使用 core.middleware 内置的本地默认列表
+    CORS_ALLOW_ORIGINS: str = ""
+
 # 实例化设置
 settings = Settings()
 
@@ -274,7 +278,7 @@ BASE_PIC_DIR.mkdir(exist_ok=True)
 # 分类白名单
 CATEGORY_CHOICES: Final[list[str]] = [
     "服装鞋帽", "家居生活", "美妆护肤", "母婴用品",
-    "食品饮料", "数码电器", "图书文具", "运动户外", "其他"
+    "食品饮料", "生鲜", "数码电器", "图书文具", "运动户外", "其他"
 ]
 
 # 微信支付配置

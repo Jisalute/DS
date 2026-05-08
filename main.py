@@ -15,6 +15,7 @@ from core.middleware import setup_cors, setup_static_files
 from core.config import get_db_config, PIC_PATH, AVATAR_UPLOAD_DIR,UVICORN_PORT
 from core.logging import setup_logging
 from database_setup import initialize_database
+from core.startup_checks import validate_production_safety
 from api.wechat_pay.routes import register_wechat_pay_routes
 from api.wechat_wxa.routes import register_wechat_wxa_routes
 from core.logging import get_logger
@@ -68,7 +69,8 @@ app = FastAPI(
     title="禹泽数字科技综合管理系统API",
     description="本网站为企业综合管理系统接口服务平台，用于提供用户管理、订单管理、商品管理及数据统计等系统功能。",
     version="1.0.0",
-    docs_url="/docs",  # 自定义 docs 路由以支持搜索过滤
+    # 必须为 None：否则内置 /docs 会先注册，自定义备案页永远不会被匹配到
+    docs_url=None,
     redoc_url="/redoc",  # ReDoc 文档地址
     openapi_url="/openapi.json",  # OpenAPI Schema 地址
     default_response_class=DecimalJSONResponse
@@ -82,6 +84,11 @@ register_exception_handlers(app)
 def on_startup():
     logger.info("=" * 50)
     logger.info("应用启动：检查并初始化数据库表结构与后台任务")
+    try:
+        validate_production_safety()
+    except RuntimeError as e:
+        logger.critical("启动配置校验失败: %s", e)
+        raise
     try:
         initialize_database()
         logger.info("数据库表结构初始化完成")
@@ -268,7 +275,9 @@ async def custom_swagger_ui_html():
         swagger_html = get_swagger_ui_html(
             openapi_url=app.openapi_url,
             title=f"{app.title} - Swagger UI",
-            swagger_ui_parameters={"filter": True}
+            oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
+            init_oauth=app.swagger_ui_init_oauth,
+            swagger_ui_parameters=app.swagger_ui_parameters,
         )
         # 确保 body 存在
         if not swagger_html.body:
@@ -280,7 +289,9 @@ async def custom_swagger_ui_html():
         return get_swagger_ui_html(
             openapi_url=app.openapi_url,
             title=f"{app.title} - Swagger UI",
-            swagger_ui_parameters={"filter": True}
+            oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
+            init_oauth=app.swagger_ui_init_oauth,
+            swagger_ui_parameters=app.swagger_ui_parameters,
         )
 
     beian_html = """

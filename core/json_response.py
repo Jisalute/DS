@@ -1,10 +1,13 @@
 from fastapi.responses import JSONResponse
 import json
+import logging
 from decimal import Decimal
 from fastapi.requests import Request as FastAPIRequest
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.exceptions import RequestValidationError
 from typing import Any
+
+_logger = logging.getLogger(__name__)
 
 
 class DecimalJSONResponse(JSONResponse):
@@ -14,7 +17,13 @@ class DecimalJSONResponse(JSONResponse):
 
 
 async def custom_http_exception_handler(request: FastAPIRequest, exc: StarletteHTTPException):
-    return DecimalJSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    # 5xx 不向客户端暴露内部 detail（可能含 SQL/路径/堆栈信息）
+    if exc.status_code >= 500:
+        _logger.error("HTTP %s: %s", exc.status_code, exc.detail)
+        detail_out = "服务器内部错误，请稍后重试"
+    else:
+        detail_out = exc.detail
+    return DecimalJSONResponse(status_code=exc.status_code, content={"detail": detail_out})
 
 
 async def validation_exception_handler(request: FastAPIRequest, exc: RequestValidationError):
@@ -22,7 +31,11 @@ async def validation_exception_handler(request: FastAPIRequest, exc: RequestVali
 
 
 async def generic_exception_handler(request: FastAPIRequest, exc: Exception):
-    return DecimalJSONResponse(status_code=500, content={"detail": str(exc)})
+    _logger.exception("未捕获异常: %s", exc)
+    return DecimalJSONResponse(
+        status_code=500,
+        content={"detail": "服务器内部错误，请稍后重试"},
+    )
 
 
 def register_exception_handlers(app: Any) -> None:

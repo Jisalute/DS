@@ -4,7 +4,6 @@
 兼容开发环境和生产环境
 """
 
-import os
 import uuid
 import logging
 import secrets  # ✅ 新增：用于生成安全随机token
@@ -16,7 +15,7 @@ from fastapi import HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from core.database import get_conn
-from core.config import JWT_SECRET_KEY, JWT_ALGORITHM, JWT_EXPIRE_MINUTES
+from core.config import JWT_SECRET_KEY, JWT_ALGORITHM, JWT_EXPIRE_MINUTES, ENABLE_UUID_AUTH
 from core.logging import get_logger
 
 # 初始化日志
@@ -24,13 +23,6 @@ logger = get_logger(__name__)
 
 # 安全方案实例
 security = HTTPBearer()
-
-# JWT 配置
-JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "10080"))  # 默认7天
-
-# 认证模式开关
-ENABLE_UUID_AUTH = os.getenv("ENABLE_UUID_AUTH", "1") == "1"  # 默认开启UUID模式
-
 
 # ========================================
 # 主认证函数 - 修复版
@@ -74,7 +66,7 @@ async def get_current_user(
         return await _get_user_from_jwt(token)
     elif len(token) == 36 and '-' in token:
         # UUID 格式（36位）
-        if ENABLE_UUID_AUTH:
+        if bool(ENABLE_UUID_AUTH):
             logger.info(f"检测到 UUID 令牌，使用 UUID 认证 - Token: {token[:8]}...")
             return await _get_user_from_uuid(token)
         else:
@@ -162,7 +154,7 @@ async def _get_user_from_wechat_token(token: str) -> Dict[str, Any]:
         logger.error(f"微信Token认证异常: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"认证服务异常: {str(e)}",
+            detail="认证服务异常，请稍后重试",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -240,7 +232,7 @@ async def _get_user_from_jwt(token: str) -> Dict[str, Any]:
         logger.error(f"JWT认证异常: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"认证服务异常: {str(e)}",
+            detail="认证服务异常，请稍后重试",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -321,7 +313,7 @@ async def _get_user_from_uuid(token: str) -> Dict[str, Any]:
         logger.error(f"UUID认证异常: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"认证服务异常: {str(e)}",
+            detail="认证服务异常，请稍后重试",
             headers={"WWW-Authenticate": "Bearer"},
         )
 

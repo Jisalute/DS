@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 from core.database import get_conn
 from core.config import settings
 from core.logging import get_logger
-from services.finance_service import FinanceService
+from services.finance_service import FinanceService, NOMINAL_SUBPOOL_SLICE
 from services.notify_service import notify_merchant
 from pathlib import Path
 import pymysql
@@ -622,7 +622,14 @@ class OfflineService:
                 # 2. 资金分账
                 finance = FinanceService()
                 allocs = finance.get_pool_allocations()
-                merchant_ratio = allocs.get('merchant_balance', Decimal('0.80'))
+                platform_rate = finance.get_distribution_platform_rate()
+                subpool_scale = (
+                    platform_rate / NOMINAL_SUBPOOL_SLICE
+                    if NOMINAL_SUBPOOL_SLICE > 0
+                    else Decimal("1")
+                )
+                # 与线上一致：子池合计占基数 platform_rate，商家占 1−platform_rate（避免收入池轧差为负）
+                merchant_ratio = Decimal("1") - platform_rate
 
                 # ✅ 统一基数 = 实付金额 + 优惠券金额
                 distribution_base = amount + coupon_discount
@@ -660,13 +667,17 @@ class OfflineService:
                 for pool_type, ratio in allocs.items():
                     if pool_type == 'merchant_balance' or ratio <= 0:
                         continue
-                    alloc_amount = (distribution_base * ratio).quantize(Decimal("0.000001"))
+                    alloc_amount = (distribution_base * ratio * subpool_scale).quantize(
+                        Decimal("0.000001")
+                    )
                     finance._add_pool_balance(
                         cur, 'platform_revenue_pool', -alloc_amount,
                         f"线下订单分配: {order_no} -> {pool_type}", merchant_id
                     )
                     if pool_type == 'fund_pool' and has_referrer and normal_paid > 0:
-                        referral_amount = (normal_paid * ratio).quantize(Decimal("0.000001"))
+                        referral_amount = (normal_paid * ratio * subpool_scale).quantize(
+                            Decimal("0.000001")
+                        )
                         finance._grant_referral_points(cur, referrer_id, referral_amount, order_no)
                         fund_pool_amount = alloc_amount - referral_amount
                         if fund_pool_amount > 0:
@@ -703,8 +714,8 @@ class OfflineService:
                         ),
                     )
 
-                # 4. 公司积分池增加（基于完整基数）
-                platform_points_amount = distribution_base * Decimal('0.20')
+                # 4. 公司积分池增加（与平台计提比例一致）
+                platform_points_amount = distribution_base * platform_rate
                 if platform_points_amount > 0:
                     finance._add_pool_balance(
                         cur, 'company_points', platform_points_amount,

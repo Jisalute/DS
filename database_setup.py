@@ -184,7 +184,7 @@ class DatabaseManager:
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_user (user_id),
                     INDEX idx_order_number (order_number),
-                    INDEX idx_trans (transaction_id),
+                    UNIQUE KEY uk_orders_transaction_id (transaction_id),
                     INDEX idx_pay_time (pay_time),
                     INDEX idx_created_at (created_at),
                     INDEX idx_status (status),
@@ -967,9 +967,31 @@ class DatabaseManager:
             else:
                 logger.warning(f"⚠️ 创建索引失败: {e}")
 
+        self._ensure_orders_transaction_id_unique(cursor)
+
         self._init_finance_accounts(cursor)
         self._init_system_config(cursor)  # 新增
         logger.info("数据库表结构初始化完成")
+
+    def _ensure_orders_transaction_id_unique(self, cursor):
+        """为 orders.transaction_id 添加唯一索引（幂等；与新建表 DDL 一致）。"""
+        try:
+            cursor.execute(
+                "CREATE UNIQUE INDEX uk_orders_transaction_id ON orders (transaction_id)"
+            )
+            logger.info("✅ 已创建 orders.uk_orders_transaction_id 唯一索引")
+        except pymysql.MySQLError as e:
+            code = e.args[0]
+            if code == 1061:
+                logger.debug("ℹ️ uk_orders_transaction_id 已存在，跳过创建")
+            elif code == 1062:
+                logger.warning(
+                    "⚠️ orders.transaction_id 存在重复非空值，无法创建唯一索引；"
+                    "请清洗重复数据后执行: "
+                    "CREATE UNIQUE INDEX uk_orders_transaction_id ON orders (transaction_id);"
+                )
+            else:
+                logger.warning(f"⚠️ 创建 uk_orders_transaction_id 失败: {e}")
 
     def _add_cart_foreign_keys(self, cursor):
         """为 cart 表添加外键约束（如果不存在）"""
@@ -1533,6 +1555,34 @@ class DatabaseManager:
             logger.info("已确保各资金池行存在且写入默认 allocation 到 config_params")
         except Exception as e:
             logger.debug(f"⚠️ 确保各资金池 config_params 写入失败（已忽略）: {e}")
+
+        # 平台计提比例（相对分账基数），默认 0.20，与线上下结算一致
+        try:
+            cursor.execute(
+                "SELECT id, config_params FROM finance_accounts WHERE account_type = %s LIMIT 1",
+                ("platform_revenue_pool",),
+            )
+            row = cursor.fetchone()
+            if row:
+                cp = row.get("config_params")
+                try:
+                    if cp:
+                        parsed = json.loads(cp) if isinstance(cp, str) else cp
+                    else:
+                        parsed = {}
+                    if not isinstance(parsed, dict):
+                        parsed = {}
+                except (TypeError, json.JSONDecodeError):
+                    parsed = {}
+                if "distribution_platform_rate" not in parsed:
+                    parsed["distribution_platform_rate"] = "0.20"
+                    cursor.execute(
+                        "UPDATE finance_accounts SET config_params = %s WHERE id = %s",
+                        (json.dumps(parsed, ensure_ascii=False), row["id"]),
+                    )
+                    logger.info("已为 platform_revenue_pool 写入默认 distribution_platform_rate=0.20")
+        except Exception as e:
+            logger.debug(f"⚠️ 写入 distribution_platform_rate 默认失败（已忽略）: {e}")
 
     def _init_system_config(self, cursor):
         """初始化系统配置默认值"""

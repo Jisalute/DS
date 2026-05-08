@@ -435,7 +435,16 @@ async def _handle_online_pay_notify(order_no: str, wx_total: int, data: dict) ->
                 from api.order.order import OrderManager
                 OrderManager.update_status(order_no, next_status, external_conn=conn)
 
-                conn.commit()
+                try:
+                    conn.commit()
+                except pymysql.err.IntegrityError as ie:
+                    conn.rollback()
+                    logger.error(
+                        "[online-pay] 提交失败（唯一约束，常见为 transaction_id 冲突）: order=%s err=%s",
+                        order_no,
+                        ie,
+                    )
+                    raise ValueError("transaction_id 唯一约束冲突") from ie
 
         logger.info(f"[online-pay] 线上订单支付成功: {order_no}")
         if next_status == "pending_recv" and order.get("delivery_way") == "pickup":

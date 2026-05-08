@@ -64,7 +64,6 @@ def main():
     parser.add_argument('--url', default=DEFAULT_URL)
     parser.add_argument('--key', default=DEFAULT_KEY_PATH)
     parser.add_argument('--xml', action='store_true', help='Use XML wrapper')
-    parser.add_argument('--bypass', action='store_true', help='Add X-Bypass-Signature header to skip verification on server (dev only)')
     parser.add_argument('--out_trade_no', default='TEST123')
     parser.add_argument('--amount', type=int, default=100)
     args = parser.parse_args()
@@ -92,9 +91,6 @@ def main():
         'Wechatpay-Nonce': nonce,
         'Wechatpay-Serial': 'TEST_SERIAL'
     }
-
-    if args.bypass:
-        headers['X-Bypass-Signature'] = 'true'
 
     print('发送到:', url)
     print('Headers:', {k: headers[k] for k in headers if k != 'Wechatpay-Signature'})
