@@ -35,6 +35,11 @@ async def create_jsapi_order(request: Request):
     """创建 JSAPI 订单并返回前端调用 `wx.requestPayment`/小程序支付所需参数。
     请求 JSON：out_trade_no/order_id, total_fee(分，须与服务端应付一致), openid, description(可选)；
     coupon_ids(可选,多张券ID数组) 或 coupon_id(可选,单张)；points_to_use(可选)
+
+    前端调起说明（微信 V3）：
+    - 使用返回的 `pay_params` 原样传入 `wx.requestPayment`，且勿用 `undefined` 覆盖 `signType`
+      （文档默认 signType 为 MD5，若被覆盖为空会误走 V2 分支，客户端可能报「缺少 total_fee」类提示）。
+    - `package` 必须为 `prepay_id=wx...` 且等号后非空；若接口包在 `{ code, data }` 内，请取 `data.pay_params`。
     """
     try:
         payload = await request.json()
@@ -252,11 +257,18 @@ async def create_jsapi_order(request: Request):
 
         # 2) 生成前端支付参数（含 paySign）
         pay_params = pay_client.generate_jsapi_pay_params(prepay_id)
+        pkg_val = (pay_params.get("package") or "").strip()
+        prepay_tail = pkg_val[len("prepay_id=") :] if pkg_val.startswith("prepay_id=") else ""
+        if not prepay_tail.strip():
+            logger.error("生成的 package 无效(预支付 id 为空): package=%r prepay_id=%r", pkg_val, prepay_id)
+            raise HTTPException(status_code=500, detail="payment package invalid (empty prepay_id)")
 
         return {
             "prepay_id": prepay_id,
             "pay_params": pay_params,
-            "wechat_raw_response": resp
+            # 与本次微信下单一致的服务端应付金额（分），供展示/对账；V3 调起支付仍以 pay_params 为准
+            "total_fee": int(total_fee),
+            "wechat_raw_response": resp,
         }
 
     except HTTPException:

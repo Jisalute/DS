@@ -30,6 +30,8 @@ logger = get_logger(__name__)
 
 # 各子资金池 allocation 配置之和的基准（默认 0.20）；实际划出比例由 get_distribution_platform_rate() 决定并按此基准缩放
 NOMINAL_SUBPOOL_SLICE = Decimal("0.20")
+# 会员升星直推（推荐）奖励占单价比例默认值；可通过接口覆盖，持久化见 get_direct_referral_reward_rate
+DEFAULT_DIRECT_REFERRAL_REWARD_RATE = Decimal("0.25")
 
 
 def max_coupon_total_yuan(merchandise_total: Decimal, points_discount: Decimal) -> Decimal:
@@ -192,6 +194,78 @@ class FinanceService:
                 )
             conn.commit()
         logger.info("已更新 distribution_platform_rate=%s", d)
+        return d
+
+    def get_direct_referral_reward_rate(self) -> Decimal:
+        """直推（推荐）奖励占会员单价 single_price 的比例，默认 0.25。
+
+        仅影响 0→1 星推荐奖励及会员退款时对推荐人的回冲；不影响团队奖励。
+        持久化键：platform_revenue_pool.config_params.direct_referral_reward_rate
+        """
+        default = DEFAULT_DIRECT_REFERRAL_REWARD_RATE
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT config_params FROM finance_accounts WHERE account_type = %s LIMIT 1",
+                        ("platform_revenue_pool",),
+                    )
+                    row = cur.fetchone()
+                    if not row or not row.get("config_params"):
+                        return default
+                    cp = row["config_params"]
+                    if isinstance(cp, str):
+                        parsed = json.loads(cp)
+                    else:
+                        parsed = cp or {}
+                    if not isinstance(parsed, dict):
+                        return default
+                    raw = parsed.get("direct_referral_reward_rate")
+                    if raw is None or raw == "":
+                        return default
+                    d = Decimal(str(raw)).quantize(Decimal("0.000001"))
+                    if d <= Decimal("0") or d > Decimal("1"):
+                        logger.warning(
+                            "direct_referral_reward_rate 非法(%s)，回退默认 %s", raw, default
+                        )
+                        return default
+                    return d
+        except Exception as e:
+            logger.debug("读取 direct_referral_reward_rate 失败，使用默认 %s: %s", default, e)
+            return default
+
+    def set_direct_referral_reward_rate(self, rate: Decimal) -> Decimal:
+        """设置直推奖励比例（不改团队奖励）。"""
+        d = Decimal(str(rate)).quantize(Decimal("0.000001"))
+        if d <= Decimal("0") or d > Decimal("1"):
+            raise ValueError("direct_referral_reward_rate 须在 (0, 1] 之间")
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, config_params FROM finance_accounts WHERE account_type = %s LIMIT 1",
+                    ("platform_revenue_pool",),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise FinanceException("缺少 platform_revenue_pool 账户行，请先初始化 finance_accounts")
+                cp = row.get("config_params")
+                try:
+                    if isinstance(cp, str):
+                        parsed = json.loads(cp) if cp else {}
+                    else:
+                        parsed = cp or {}
+                    if not isinstance(parsed, dict):
+                        parsed = {}
+                except (TypeError, json.JSONDecodeError):
+                    parsed = {}
+                parsed["direct_referral_reward_rate"] = str(d)
+                cur.execute(
+                    "UPDATE finance_accounts SET config_params = %s WHERE id = %s",
+                    (json.dumps(parsed, ensure_ascii=False), row["id"]),
+                )
+            conn.commit()
+        logger.info("已更新 direct_referral_reward_rate=%s", d)
         return d
 
     def __init__(self, session: Optional[PyMySQLAdapter] = None):
@@ -1038,7 +1112,7 @@ class FinanceService:
                 referrer_level = referrer_info['member_level'] if referrer_info else 0
 
                 if referrer_level >= 1:
-                    reward_amount = single_price * Decimal('0.30')
+                    reward_amount = single_price * self.get_direct_referral_reward_rate()
 
                     # 发放到 referral_points
                     cur.execute(
@@ -1172,7 +1246,7 @@ class FinanceService:
             recipient_id = reward_recipient['user_id']
             actual_layer = reward_recipient['actual_layer']
 
-            reward_amount = single_price * Decimal('0.50')
+            reward_amount = single_price * Decimal('0.25')
 
             # 发放到 team_reward_points
             cur.execute(
@@ -1812,7 +1886,9 @@ class FinanceService:
                 )
                 referrer = result.fetchone()
                 if referrer and referrer.referrer_id:
-                    reward_amount = Decimal(str(order.original_amount)) * Decimal('0.30')
+                    reward_amount = (
+                        Decimal(str(order.original_amount)) * self.get_direct_referral_reward_rate()
+                    )
                     self.session.execute(
                         """UPDATE users SET promotion_balance = promotion_balance - %s
                            WHERE id = %s AND promotion_balance >= %s""",

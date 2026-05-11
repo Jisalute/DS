@@ -609,6 +609,17 @@ class DistributionPlatformRateRequest(BaseModel):
     )
 
 
+class DirectReferralRewardRateRequest(BaseModel):
+    """会员升星直推（推荐）奖励占单价比例；不影响团队奖励。"""
+
+    rate: float = Field(
+        ...,
+        gt=0,
+        le=1.0,
+        description="例如 0.25 表示推荐奖励 = 会员单价 × 25%",
+    )
+
+
 @router.get(
     "/api/fund-pools/distribution-platform-rate",
     response_model=ResponseModel,
@@ -657,6 +668,57 @@ async def set_distribution_platform_rate(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"更新 distribution_platform_rate 失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/api/fund-pools/direct-referral-reward-rate",
+    response_model=ResponseModel,
+    summary="查询直推（推荐）奖励比例",
+)
+async def get_direct_referral_reward_rate(
+    service: FinanceService = Depends(get_finance_service),
+):
+    """读取会员升星直推奖励占单价比例（默认 0.25）。不影响团队奖励。"""
+    try:
+        r = service.get_direct_referral_reward_rate()
+        return ResponseModel(
+            success=True,
+            message="ok",
+            data={
+                "direct_referral_reward_rate": float(r),
+                "default_rate": 0.25,
+                "description": "仅用于 0→1 星推荐奖励（referral_points）及会员退款时对推荐人的回冲；团队奖励比例不在此配置。",
+            },
+        )
+    except Exception as e:
+        logger.error(f"查询 direct_referral_reward_rate 失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post(
+    "/api/fund-pools/direct-referral-reward-rate",
+    response_model=ResponseModel,
+    summary="设置直推（推荐）奖励比例",
+)
+async def set_direct_referral_reward_rate(
+    request: DirectReferralRewardRateRequest,
+    service: FinanceService = Depends(get_finance_service),
+):
+    """手动调整直推奖励比例；不修改团队奖励。"""
+    try:
+        r = service.set_direct_referral_reward_rate(Decimal(str(request.rate)))
+        return ResponseModel(
+            success=True,
+            message="已更新直推（推荐）奖励比例",
+            data={"direct_referral_reward_rate": float(r)},
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"更新 direct_referral_reward_rate 失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

@@ -774,6 +774,21 @@ class WeChatPayClient:
 
         sign_str = f"{WECHAT_APP_ID}\n{timestamp}\n{nonce_str}\n{pkg}\n"
 
+        if self.mock_mode:
+            # 与 create_jsapi_order 的 MOCK 分支配套：本地联调无需证书，paySign 为占位（调起真实支付会失败）
+            logger.info("【MOCK】生成模拟 JSAPI 支付参数（无需商户私钥）")
+            pay_sign = base64.b64encode(
+                hashlib.sha256(sign_str.encode("utf-8")).digest()
+            ).decode("utf-8")
+            return {
+                "appId": WECHAT_APP_ID,
+                "timeStamp": timestamp,
+                "nonceStr": nonce_str,
+                "package": pkg,
+                "signType": "RSA",
+                "paySign": pay_sign,
+            }
+
         if not self.private_key:
             raise RuntimeError("商户私钥未加载，无法生成 paySign")
 
