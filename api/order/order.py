@@ -835,8 +835,9 @@ class OrderManager:
             "商品信息", "商品规格", "下单时间", "支付时间", "发货时间"
         ]
 
-        header_font = Font(bold=True, color="FFFFFF")
-        header_fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+        # 避免白字+深色底：部分手机端 WPS/Excel 对 xlsx 填充渲染异常时底变为白底，白字不可见，首行像「没有表头」
+        header_font = Font(bold=True, color="1F2937")
+        header_fill = PatternFill(start_color="E5E7EB", end_color="E5E7EB", fill_type="solid")
         header_alignment = Alignment(horizontal="center", vertical="center")
         thin_border = Border(
             left=Side(style='thin'), right=Side(style='thin'),
