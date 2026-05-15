@@ -1,10 +1,13 @@
 # core/middleware.py - 统一中间件配置
 from pathlib import Path
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi import FastAPI
 
 from core.config import settings
+from core.request_context import new_request_id, set_request_id
 
 # 开发环境未配置 CORS_ALLOW_ORIGINS 时的默认前端源（禁止使用 * + credentials）
 _DEFAULT_DEV_CORS_ORIGINS = [
@@ -30,6 +33,22 @@ def resolve_cors_origins() -> tuple[list[str], bool]:
     if is_prod:
         return [], True
     return list(_DEFAULT_DEV_CORS_ORIGINS), True
+
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    """为每个请求注入 X-Request-ID，并写入日志上下文。"""
+
+    async def dispatch(self, request: Request, call_next):
+        incoming = request.headers.get("X-Request-ID", "").strip()
+        rid = incoming if incoming else new_request_id()
+        set_request_id(rid)
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = rid
+        return response
+
+
+def setup_request_id(app: FastAPI) -> None:
+    app.add_middleware(RequestIdMiddleware)
 
 
 def setup_cors(app: FastAPI):

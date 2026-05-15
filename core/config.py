@@ -46,6 +46,33 @@ class Settings(BaseSettings):
     MYSQL_USER: str
     MYSQL_PASSWORD: str
     MYSQL_DATABASE: str
+    # 2c2g：单 worker 池大小；总连接 ≈ UVICORN_WORKERS × MYSQL_POOL_SIZE（留余量给 MySQL 默认 151）
+    MYSQL_POOL_SIZE: int = 5
+    UVICORN_WORKERS: int = 2
+
+    # Redis（下单锁、全局限流、可选分布式任务锁）
+    REDIS_ENABLED: bool = True
+    REDIS_HOST: str = "127.0.0.1"
+    REDIS_PORT: int = 6379
+    REDIS_DB: int = 0
+    REDIS_PASSWORD: str = ""
+
+    # 下单 Redis 锁 TTL（秒），应大于典型创建订单事务时长
+    ORDER_CREATE_LOCK_TTL: int = 120
+    ORDER_CREATE_LOCK_RENEW: int = 30
+
+    # 运维：生产建议 SKIP_STARTUP_DDL=1，迁移由 scripts/migrate.py 单独执行
+    SKIP_STARTUP_DDL: bool = False
+    RUN_MIGRATE_ON_STARTUP: bool = True
+
+    # 日志轮转
+    LOG_MAX_BYTES: int = 10 * 1024 * 1024
+    LOG_BACKUP_COUNT: int = 10
+
+    # 微信 API 全局限流（Redis 滑动窗口；无 Redis 时回退进程内限流）
+    WX_GLOBAL_RATE_LIMIT_ENABLED: bool = True
+    WX_SETTLEMENT_MAX_PER_SEC: int = 5
+    WX_QUERY_MAX_PER_SEC: int = 10
 
     # 微信/支付相关
     WECHAT_APP_ID: str = ""

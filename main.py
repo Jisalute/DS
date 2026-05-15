@@ -11,8 +11,9 @@ from fastapi.responses import HTMLResponse, FileResponse
 import re
 from core.json_response import DecimalJSONResponse, register_exception_handlers
 from fastapi.staticfiles import StaticFiles
-from core.middleware import setup_cors, setup_static_files
-from core.config import get_db_config, PIC_PATH, AVATAR_UPLOAD_DIR,UVICORN_PORT
+from core.middleware import setup_cors, setup_static_files, setup_request_id
+from core.health import router as health_router
+from core.config import get_db_config, PIC_PATH, AVATAR_UPLOAD_DIR, UVICORN_PORT, settings
 from core.logging import setup_logging
 from database_setup import initialize_database
 from core.startup_checks import validate_production_safety
@@ -89,18 +90,46 @@ def on_startup():
     except RuntimeError as e:
         logger.critical("启动配置校验失败: %s", e)
         raise
+
+    if settings.RUN_MIGRATE_ON_STARTUP and not settings.SKIP_STARTUP_DDL:
+        try:
+            from scripts.migrate import run_migrations
+
+            run_migrations()
+            logger.info("启动迁移脚本执行完成")
+        except Exception as e:
+            logger.warning("启动迁移脚本失败（可稍后手动执行 migrate.py）: %s", e)
+
+    if not settings.SKIP_STARTUP_DDL:
+        try:
+            initialize_database()
+            logger.info("数据库表结构初始化完成")
+        except Exception as e:
+            logger.error("初始化数据库失败: %s", e, exc_info=True)
+    else:
+        logger.info("SKIP_STARTUP_DDL=1，跳过 on_startup 表结构初始化")
+
     try:
-        initialize_database()
-        logger.info("数据库表结构初始化完成")
+        from core.auth import refresh_sessions_table_cache
+
+        refresh_sessions_table_cache()
     except Exception as e:
-        logger.error(f"初始化数据库失败: {e}", exc_info=True)
+        logger.warning("刷新 sessions 表缓存失败: %s", e)
+
+    try:
+        from api.order.order import start_order_expire_task
+
+        start_order_expire_task()
+    except Exception as e:
+        logger.error("启动订单过期任务失败: %s", e)
 
     try:
         from database_setup import start_background_tasks
+
         start_background_tasks()
-        logger.info("✅ 后台定时任务已成功启动")
+        logger.info("后台定时任务已启动")
     except Exception as e:
-        logger.error(f"❌ 启动后台定时任务失败: {e}", exc_info=True)
+        logger.error("启动后台定时任务失败: %s", e, exc_info=True)
     logger.info("=" * 50)
 
     # 启动时刷新快递公司列表缓存
@@ -206,9 +235,10 @@ app.include_router(pay_bridge_router)
 
 app.mount("/offline", StaticFiles(directory=str(offline_static_dir)), name="offline_static")
 
-# 添加 CORS 中间件和静态文件（统一配置）pic_path
+setup_request_id(app)
 setup_cors(app)
 setup_static_files(app)
+app.include_router(health_router)
 
 # 注册所有模块的路由（必须在设置 custom_openapi 之前注册）
 register_finance_routes(app)
