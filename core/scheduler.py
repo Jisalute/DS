@@ -19,23 +19,33 @@ class TaskScheduler:
     def __init__(self):
         self.scheduler = BackgroundScheduler()
         self.pay_client = WeChatPayClient()
-        self.lock_file = None  # 新增：锁文件句柄
+        self.lock_file = None
+        self._dist_lock = None
+
+    def _acquire_scheduler_lock(self) -> bool:
+        if sys.platform != "win32":
+            lock_file_path = "/tmp/scheduler.lock"
+            try:
+                self.lock_file = open(lock_file_path, "w")
+                fcntl.flock(self.lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                return False
+            except Exception as e:
+                logger.error("获取调度器文件锁失败: %s", e)
+                return False
+        from core.distributed_lock import RedisRenewableLock
+
+        self._dist_lock = RedisRenewableLock(
+            "task:apscheduler", ttl_seconds=3600, renew_interval_seconds=600
+        )
+        return self._dist_lock.acquire()
 
     def start(self):
-        """启动所有定时任务（带进程间锁）"""
-        # ========== 新增：尝试获取文件锁 ==========
-        lock_file_path = "/tmp/scheduler.lock"
-        try:
-            self.lock_file = open(lock_file_path, "w")
-            fcntl.flock(self.lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        """启动所有定时任务（带进程间锁：Linux fcntl / Windows Redis 续期锁）"""
+        if not self._acquire_scheduler_lock():
             logger.info("另一个进程已持有调度器锁，本进程跳过启动定时任务")
-            self.lock_file = None
             return
-        except Exception as e:
-            logger.error(f"获取调度器锁失败: {e}，将继续启动（可能导致重复）")
-            self.lock_file = None
-        # ========================================
 
         # 每天凌晨4点清理过期草稿
         self.scheduler.add_job(

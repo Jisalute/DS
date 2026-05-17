@@ -26,98 +26,18 @@ from core.table_access import build_dynamic_select, get_table_structure, _quote_
 from core.table_access import build_dynamic_select, get_table_structure, _quote_identifier, build_select_list
 from core.db_adapter import build_in_placeholders
 
+from services.finance.constants import (
+    DEFAULT_DIRECT_REFERRAL_REWARD_RATE,
+    NOMINAL_SUBPOOL_SLICE,
+)
+from services.finance.discount_helpers import (
+    cap_discounts_to_merchandise_total,
+    max_coupon_total_yuan,
+    parse_offline_coupon_ids,
+    parse_pending_coupon_ids,
+)
+
 logger = get_logger(__name__)
-
-# 各子资金池 allocation 配置之和的基准（默认 0.20）；实际划出比例由 get_distribution_platform_rate() 决定并按此基准缩放
-NOMINAL_SUBPOOL_SLICE = Decimal("0.20")
-# 会员升星直推（推荐）奖励占单价比例默认值；可通过接口覆盖，持久化见 get_direct_referral_reward_rate
-DEFAULT_DIRECT_REFERRAL_REWARD_RATE = Decimal("0.25")
-
-
-def max_coupon_total_yuan(merchandise_total: Decimal, points_discount: Decimal) -> Decimal:
-    """优惠券叠加面额上限：ceil(商品售卖价 − 积分抵扣金额)，金额向上取整到元。"""
-    mt = merchandise_total if merchandise_total > 0 else Decimal('0')
-    pd = points_discount if points_discount > 0 else Decimal('0')
-    rem = mt - pd
-    if rem < Decimal('0'):
-        rem = Decimal('0')
-    return rem.quantize(Decimal('1'), rounding=ROUND_CEILING)
-
-
-def cap_discounts_to_merchandise_total(
-    merchandise_total: Decimal,
-    coupon_discount: Decimal,
-    points_to_use: Decimal,
-) -> tuple[Decimal, Decimal, Decimal]:
-    """
-    先按积分抵扣（不超过原价），再按「券上限 = ceil(原价−积分抵扣) 到元」限制优惠券总额，
-    最后将券面额封顶到不超过扣积分后的剩余应付。
-    返回 (coupon_discount, points_discount, capped_points_to_use)。
-    """
-    mt = merchandise_total if merchandise_total > 0 else Decimal('0')
-    pu = points_to_use if points_to_use > 0 else Decimal('0')
-    pd = pu * POINTS_DISCOUNT_RATE
-    if pd > mt:
-        pd = mt
-        if POINTS_DISCOUNT_RATE and POINTS_DISCOUNT_RATE > 0:
-            pu = (pd / POINTS_DISCOUNT_RATE).quantize(Decimal('0.0001'), rounding=ROUND_DOWN)
-        else:
-            pu = Decimal('0')
-    max_c = max_coupon_total_yuan(mt, pd)
-    c = coupon_discount if coupon_discount > 0 else Decimal('0')
-    c = min(c, max_c)
-    # 券实际抵扣不能超过「扣完积分抵扣后的商品应付」，避免出现负实付（如 0.05 元商品用 1 元券）
-    rem_after_points = mt - pd
-    if rem_after_points < Decimal('0'):
-        rem_after_points = Decimal('0')
-    c = min(c, rem_after_points)
-    return c, pd, pu
-
-
-def parse_pending_coupon_ids(order_info: dict) -> list[int]:
-    """解析订单上的多张券 ID：优先 pending_coupon_ids(JSON)，否则退回 pending_coupon_id。"""
-    raw = order_info.get('pending_coupon_ids')
-    if raw is not None and raw != '':
-        try:
-            if isinstance(raw, (bytes, bytearray)):
-                raw = raw.decode('utf-8')
-            if isinstance(raw, str):
-                data = json.loads(raw)
-            else:
-                data = raw
-            if not isinstance(data, list):
-                return []
-            ids = sorted({int(x) for x in data if x is not None})
-            return ids
-        except (TypeError, ValueError, json.JSONDecodeError):
-            pass
-    pid = order_info.get('pending_coupon_id')
-    if pid is not None and pid != '' and int(pid) != 0:
-        return [int(pid)]
-    return []
-
-
-def parse_offline_coupon_ids(order_row: dict) -> list[int]:
-    """解析线下单上的多张券 ID：优先 coupon_ids(JSON)，否则退回 coupon_id。"""
-    raw = order_row.get("coupon_ids")
-    if raw is not None and raw != "":
-        try:
-            if isinstance(raw, (bytes, bytearray)):
-                raw = raw.decode("utf-8")
-            if isinstance(raw, str):
-                data = json.loads(raw)
-            else:
-                data = raw
-            if not isinstance(data, list):
-                return []
-            ids = sorted({int(x) for x in data if x is not None})
-            return ids
-        except (TypeError, ValueError, json.JSONDecodeError):
-            pass
-    cid = order_row.get("coupon_id")
-    if cid is not None and cid != "" and int(cid) != 0:
-        return [int(cid)]
-    return []
 
 
 class FinanceService:

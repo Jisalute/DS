@@ -27,99 +27,94 @@ from io import BytesIO
 from typing import List, Dict, Any
 from fastapi.responses import StreamingResponse
 
-# ==================== 新增：导入 Redis 用于分布式锁 ====================
-import redis
 import redis.exceptions
+
+from core.distributed_lock import RedisRenewableLock, redis_or_mysql_lock
+from core.redis_client import get_redis_client
 
 logger = get_logger(__name__)
 router = APIRouter()
 
+redis_client = get_redis_client()
 
-# ==================== 新增：Redis 客户端初始化（带容错） ====================
-def _get_redis_client():
-    """获取 Redis 客户端，如果未配置则返回 None"""
-    try:
-        redis_host = getattr(settings, 'REDIS_HOST', 'localhost')
-        redis_port = getattr(settings, 'REDIS_PORT', 6379)
-        redis_db = getattr(settings, 'REDIS_DB', 0)
-
-        client = redis.Redis(
-            host=redis_host,
-            port=redis_port,
-            db=redis_db,
-            decode_responses=True,
-            socket_connect_timeout=2,
-            socket_timeout=2
-        )
-        client.ping()
-        return client
-    except Exception as e:
-        logger.warning(f"Redis 连接失败（将使用数据库兜底）: {e}")
-        return None
+_expire_task_started = False
+_expire_task_lock = threading.Lock()
+EXPIRE_LOCK_REDIS_KEY = "task:order_expire_cancel"
+EXPIRE_LOCK_MYSQL_NAME = "ds_order_expire_cancel"
 
 
-# 全局 Redis 客户端
-redis_client = _get_redis_client()
+def _cancel_expire_orders_once() -> int:
+    """取消一批过期 pending_pay 订单，返回处理数量。"""
+    cancelled = 0
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            now = datetime.now()
+            cur.execute(
+                """
+                SELECT id, order_number
+                FROM orders
+                WHERE status='pending_pay'
+                  AND expire_at IS NOT NULL
+                  AND expire_at <= %s
+                """,
+                (now,),
+            )
+            for o in cur.fetchall():
+                oid, ono = o["id"], o["order_number"]
+                cur.execute(
+                    "SELECT id FROM pending_rewards WHERE order_id = %s AND status = 'pending'",
+                    (oid,),
+                )
+                for reward in cur.fetchall():
+                    cur.execute("DELETE FROM pending_rewards WHERE id = %s", (reward["id"],))
+                    logger.info("删除订单 %s 待发放奖励 id=%s", ono, reward["id"])
+                cur.execute(
+                    "SELECT product_id,quantity FROM order_items WHERE order_id=%s",
+                    (oid,),
+                )
+                for it in cur.fetchall():
+                    cur.execute(
+                        "UPDATE product_skus SET stock=stock+%s WHERE product_id=%s",
+                        (it["quantity"], it["product_id"]),
+                    )
+                cur.execute(
+                    "UPDATE orders SET status='cancelled',updated_at=NOW() WHERE id=%s",
+                    (oid,),
+                )
+                cancelled += 1
+                logger.info("订单 %s 已自动取消（支付超时）", ono)
+            conn.commit()
+    return cancelled
 
 
-def _cancel_expire_orders():
-    """每分钟扫描一次，把过期的 pending_pay 订单取消"""
+def _cancel_expire_orders_loop():
+    """每分钟扫描；单点执行（Redis 或 MySQL GET_LOCK）。"""
     while True:
         try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    now = datetime.now()
-                    cur.execute("""
-                        SELECT id, order_number
-                        FROM orders
-                        WHERE status='pending_pay'
-                          AND expire_at IS NOT NULL
-                          AND expire_at <= %s
-                    """, (now,))
-                    for o in cur.fetchall():
-                        oid, ono = o["id"], o["order_number"]
-
-                        # 删除该订单的待发放奖励记录
-                        cur.execute(
-                            "SELECT id FROM pending_rewards WHERE order_id = %s AND status = 'pending'",
-                            (oid,)
-                        )
-                        rewards = cur.fetchall()
-                        for reward in rewards:
-                            cur.execute(
-                                "DELETE FROM pending_rewards WHERE id = %s",
-                                (reward['id'],)
-                            )
-                            print(f"[expire] 删除订单 {ono} 的待发放奖励记录: ID={reward['id']}")
-
-                        # 回滚库存
-                        cur.execute(
-                            "SELECT product_id,quantity FROM order_items WHERE order_id=%s",
-                            (oid,)
-                        )
-                        for it in cur.fetchall():
-                            cur.execute(
-                                "UPDATE product_skus SET stock=stock+%s WHERE product_id=%s",
-                                (it["quantity"], it["product_id"])
-                            )
-
-                        # 改状态
-                        cur.execute(
-                            "UPDATE orders SET status='cancelled',updated_at=NOW() WHERE id=%s",
-                            (oid,)
-                        )
-                        print(f"[expire] 订单 {ono} 已自动取消")
-                    conn.commit()
+            with redis_or_mysql_lock(
+                EXPIRE_LOCK_REDIS_KEY,
+                EXPIRE_LOCK_MYSQL_NAME,
+                ttl_seconds=90,
+            ) as acquired:
+                if acquired:
+                    n = _cancel_expire_orders_once()
+                    if n:
+                        logger.info("本周期取消过期订单 %s 笔", n)
         except Exception as e:
-            print(f"[expire] error: {e}")
+            logger.exception("订单过期扫描失败: %s", e)
         time.sleep(60)
 
 
 def start_order_expire_task():
-    """由 api.order 包初始化时调用一次即可"""
-    t = threading.Thread(target=_cancel_expire_orders, daemon=True)
+    """仅启动一次（多 worker 下每进程一条线程，锁保证单点执行）。"""
+    global _expire_task_started
+    with _expire_task_lock:
+        if _expire_task_started:
+            return
+        _expire_task_started = True
+    t = threading.Thread(target=_cancel_expire_orders_loop, daemon=True, name="order-expire")
     t.start()
-    print("[expire] 订单过期守护线程已启动")
+    logger.info("订单过期守护线程已启动")
 
 
 class OrderManager:
@@ -175,19 +170,23 @@ class OrderManager:
     ) -> Optional[str]:
         """创建订单（已增加幂等性校验，防止重复创建，支持多商家订单）"""
         lock_key = f"order:create:{user_id}"
+        create_lock = RedisRenewableLock(
+            lock_key,
+            ttl_seconds=settings.ORDER_CREATE_LOCK_TTL,
+            renew_interval_seconds=settings.ORDER_CREATE_LOCK_RENEW,
+        )
         lock_acquired = False
-
         if redis_client:
             try:
-                lock_acquired = redis_client.set(lock_key, idempotency_key or "1", nx=True, ex=5)
+                lock_acquired = create_lock.acquire()
                 if not lock_acquired:
-                    logger.warning(f"用户 {user_id} 重复提交订单，Redis 锁拦截")
+                    logger.warning("用户 %s 重复提交订单，Redis 锁拦截", user_id)
                     raise HTTPException(
                         status_code=429,
-                        detail="订单创建中，请勿重复提交，或等待 5 秒后重试"
+                        detail="订单创建中，请勿重复提交，请稍后重试",
                     )
             except redis.exceptions.RedisError as e:
-                logger.error(f"Redis 锁操作失败: {e}，将降级为数据库锁")
+                logger.error("Redis 锁操作失败: %s，将降级为数据库校验", e)
                 lock_acquired = False
 
         try:
@@ -498,11 +497,8 @@ class OrderManager:
                     }
 
         finally:
-            if lock_acquired and redis_client:
-                try:
-                    redis_client.delete(lock_key)
-                except Exception as e:
-                    logger.error(f"释放 Redis 锁失败: {e}")
+            if lock_acquired:
+                create_lock.release()
 
     @staticmethod
     def list_by_user(user_id: int, status: Optional[str] = None):
@@ -1451,5 +1447,4 @@ async def export_daily_summary(
         logger.error(f"导出日报表失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-start_order_expire_task()
-# start_wechat_status_sync_task()  # 已废弃
+# 过期任务由 register_routes / on_startup 显式启动，避免 import 重复拉起线程

@@ -21,6 +21,37 @@ from core.logging import get_logger
 # 初始化日志
 logger = get_logger(__name__)
 
+# sessions 表是否存在（启动时刷新，避免每次认证 SHOW TABLES）
+_sessions_table_exists: Optional[bool] = None
+
+
+def refresh_sessions_table_cache() -> bool:
+    """启动或迁移后调用，缓存 sessions 表是否存在。"""
+    global _sessions_table_exists
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1 FROM INFORMATION_SCHEMA.TABLES
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sessions'
+                    LIMIT 1
+                    """
+                )
+                _sessions_table_exists = cur.fetchone() is not None
+    except Exception as e:
+        logger.warning("刷新 sessions 表缓存失败: %s", e)
+        _sessions_table_exists = False
+    logger.info("sessions 表缓存: exists=%s", _sessions_table_exists)
+    return bool(_sessions_table_exists)
+
+
+def _has_sessions_table() -> bool:
+    if _sessions_table_exists is None:
+        return refresh_sessions_table_cache()
+    return _sessions_table_exists
+
+
 # 安全方案实例
 security = HTTPBearer()
 
@@ -103,11 +134,7 @@ async def _get_user_from_wechat_token(token: str) -> Dict[str, Any]:
 
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # 检查 sessions 表是否存在
-                cur.execute("SHOW TABLES LIKE 'sessions'")
-                has_sessions = cur.fetchone() is not None
-
-                if has_sessions:
+                if _has_sessions_table():
                     # 使用 sessions 表（推荐方式）
                     cur.execute("""
                         SELECT s.user_id AS id, u.mobile, u.name, u.avatar_path, 
@@ -261,11 +288,7 @@ async def _get_user_from_uuid(token: str) -> Dict[str, Any]:
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # 检查 sessions 表是否存在
-                cur.execute("SHOW TABLES LIKE 'sessions'")
-                has_sessions = cur.fetchone() is not None
-
-                if has_sessions:
+                if _has_sessions_table():
                     # 使用 sessions 表（推荐方式）
                     # ✅ 修复：明确指定返回字段名为 id（使用别名）
                     cur.execute("""
@@ -376,11 +399,7 @@ def _create_uuid_token(user_id: int) -> str:
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # 检查 sessions 表是否存在
-                cur.execute("SHOW TABLES LIKE 'sessions'")
-                has_sessions = cur.fetchone() is not None
-
-                if has_sessions:
+                if _has_sessions_table():
                     # 使用 sessions 表（推荐方式）
                     sql = """
                         INSERT INTO sessions (user_id, token, created_at, expired_at)
@@ -414,8 +433,7 @@ def _create_wechat_token(user_id: int) -> str:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 # 检查 sessions 表是否存在
-                cur.execute("SHOW TABLES LIKE 'sessions'")
-                if cur.fetchone():
+                if _has_sessions_table():
                     # 使用 sessions 表
                     cur.execute("""
                         INSERT INTO sessions (user_id, token, created_at, expired_at)
@@ -466,8 +484,7 @@ def invalidate_token(token: str) -> bool:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 # 检查 sessions 表
-                cur.execute("SHOW TABLES LIKE 'sessions'")
-                if cur.fetchone():
+                if _has_sessions_table():
                     # 删除 sessions 记录
                     cur.execute("DELETE FROM sessions WHERE token = %s", (token,))
                 else:
@@ -514,5 +531,8 @@ def ensure_sessions_table():
         logger.warning(f"sessions 表创建失败（可能已存在）: {str(e)}")
 
 
-# 启动时检查 sessions 表
-ensure_sessions_table()
+# sessions 表由 scripts/migrate.py 或 initialize_database 保证；启动时仅刷新缓存
+try:
+    refresh_sessions_table_cache()
+except Exception:
+    pass
