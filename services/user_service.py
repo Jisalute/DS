@@ -442,7 +442,7 @@ class UserService:
                            used_at, created_at
                     FROM coupons
                     WHERE {where_clause}
-                    ORDER BY created_at DESC
+                    ORDER BY created_at DESC, id DESC
                     LIMIT %s OFFSET %s
                 """
                 params.extend([page_size, offset])
