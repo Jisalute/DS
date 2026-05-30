@@ -143,8 +143,44 @@ class Settings(BaseSettings):
     # 生产环境必填；开发/测试若留空则使用 core.middleware 内置的本地默认列表
     CORS_ALLOW_ORIGINS: str = ""
 
+    # 财务敏感接口管理口令（Query: admin_key=）；生产环境必填
+    ADMIN_API_KEY: SecretStr = SecretStr("")
+    # 允许通过 Bearer Token 操作财务敏感接口的用户 ID，逗号分隔，如 1,26
+    ADMIN_USER_IDS: str = "1"
+
+    # 生产环境 /docs、/openapi.json、/redoc 允许访问的 IP/CIDR，逗号分隔；留空则仅本机
+    DOCS_ALLOW_IPS: str = ""
+    # 全局拒绝访问的 IP，逗号分隔
+    IP_BLOCKLIST: str = "89.117.53.228"
+    # 财务敏感 POST 接口每 IP 每分钟最大请求数
+    FINANCE_ADMIN_RATE_LIMIT_PER_MIN: int = 5
+
 # 实例化设置
 settings = Settings()
+
+
+def parse_csv_ids(raw: str) -> frozenset[int]:
+    ids: set[int] = set()
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.add(int(part))
+    return frozenset(ids)
+
+
+def parse_csv_strings(raw: str) -> tuple[str, ...]:
+    return tuple(x.strip() for x in (raw or "").split(",") if x.strip())
+
+
+def get_admin_api_key() -> str:
+    """管理口令；开发环境未配置时回退 admin2025（与 user 路由一致）。"""
+    key = settings.ADMIN_API_KEY.get_secret_value().strip()
+    if key:
+        return key
+    env = (settings.ENVIRONMENT or "").lower()
+    if env in ("production", "prod"):
+        return ""
+    return "admin2025"
 
 # ==================== JWT配置 ====================
 JWT_SECRET_KEY: Final[str] = settings.JWT_SECRET_KEY.get_secret_value()

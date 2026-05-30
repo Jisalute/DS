@@ -6,17 +6,26 @@
 
 import uuid
 import logging
-import secrets  # ✅ 新增：用于生成安全随机token
+import secrets
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
 import jwt
-from fastapi import HTTPException, Depends
+from fastapi import HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from core.database import get_conn
-from core.config import JWT_SECRET_KEY, JWT_ALGORITHM, JWT_EXPIRE_MINUTES, ENABLE_UUID_AUTH
+from core.config import (
+    settings,
+    get_admin_api_key,
+    parse_csv_ids,
+    JWT_SECRET_KEY,
+    JWT_ALGORITHM,
+    JWT_EXPIRE_MINUTES,
+    ENABLE_UUID_AUTH,
+)
 from core.logging import get_logger
+from core.security_middleware import get_client_ip, verify_finance_admin_request
 
 # 初始化日志
 logger = get_logger(__name__)
@@ -373,6 +382,22 @@ def get_optional_user(
         return get_current_user(credentials)
     except HTTPException:
         return None
+
+
+async def require_finance_admin(request: Request) -> Dict[str, Any]:
+    """
+    财务敏感操作鉴权（与 SecurityMiddleware 规则一致）。
+    中间件已拦截未授权请求；此依赖用于路由层获取鉴权信息。
+    """
+    auth_info = getattr(request.state, "finance_admin", None)
+    if auth_info:
+        return auth_info
+    ok, auth_info = verify_finance_admin_request(request)
+    if not ok:
+        client_ip = get_client_ip(request)
+        logger.warning("require_finance_admin 鉴权失败 ip=%s path=%s", client_ip, request.url.path)
+        raise HTTPException(status_code=403, detail="需要管理员口令(admin_key)或管理员 Bearer Token")
+    return auth_info or {"auth_type": "unknown"}
 
 
 # ========================================
