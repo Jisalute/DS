@@ -140,6 +140,7 @@ class TaskScheduler:
         """每天零点自动发放日补贴"""
         try:
             from services.finance_service import FinanceService
+            from core.exceptions import FinanceException
 
             logger.info("=" * 50)
             logger.info("[定时任务] 开始执行日补贴自动发放")
@@ -153,6 +154,8 @@ class TaskScheduler:
             else:
                 logger.warning("[定时任务] 日补贴发放失败，可能余额不足或无可发放用户")
 
+        except FinanceException as e:
+            logger.warning("[定时任务] 日补贴发放跳过或失败: %s", e)
         except Exception as e:
             logger.error(f"[定时任务] 日补贴发放异常: {str(e)}", exc_info=True)
 

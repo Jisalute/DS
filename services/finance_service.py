@@ -1540,10 +1540,30 @@ class FinanceService:
             return False
 
     # ==================== 补贴发放 ====================
-    def distribute_daily_subsidy(self) -> bool:
+    def _daily_subsidy_already_distributed(self, today) -> bool:
+        """检查当日是否已执行过日补贴（会员积分批次）。"""
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1 FROM weekly_subsidy_records
+                    WHERE week_start = %s AND remark LIKE %s
+                    LIMIT 1
+                    """,
+                    (today, "日补贴（每日可分配%"),
+                )
+                return cur.fetchone() is not None
+
+    def distribute_daily_subsidy(self, force: bool = False) -> bool:
         """
         发放日补贴（每日可分配金额 = 补贴池余额 × 日补贴比例）
+        force=True 时跳过当日防重复（仅管理员手动强制发放时使用）。
         """
+        today = datetime.now().date()
+        if not force and self._daily_subsidy_already_distributed(today):
+            logger.warning("日补贴发放跳过：今日 %s 已发放过", today)
+            raise FinanceException(f"今日({today})日补贴已发放，请勿重复执行")
+
         logger.info("日补贴发放开始（每日可分配金额 = 补贴池余额 × 日比例）")
 
         pool_balance = self.get_account_balance('subsidy_pool')
@@ -1606,7 +1626,6 @@ class FinanceService:
 
         total_distributed = Decimal('0')
         total_points_deducted = Decimal('0')
-        today = datetime.now().date()
 
         try:
             with get_conn() as conn:
