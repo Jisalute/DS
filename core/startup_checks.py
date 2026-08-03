@@ -1,6 +1,6 @@
 """应用启动时的安全与配置校验（任务一：生产环境资金相关配置）"""
 
-from core.config import settings, ENVIRONMENT, get_admin_api_key
+from core.config import settings, ENVIRONMENT
 
 
 def validate_production_safety() -> None:
@@ -19,8 +19,4 @@ def validate_production_safety() -> None:
         raise RuntimeError(
             "生产环境必须在 .env 中设置 CORS_ALLOW_ORIGINS（逗号分隔的完整前端 Origin，"
             "例如 https://your-domain.com）。"
-        )
-    if not get_admin_api_key():
-        raise RuntimeError(
-            "生产环境必须在 .env 中设置 ADMIN_API_KEY（财务敏感接口管理口令）。"
         )
