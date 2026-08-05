@@ -988,7 +988,7 @@ class FinanceService:
         """
         创建推荐和团队奖励（严格层级版）
 
-        核心修复：
+        核心规则：
         1. 团队奖励必须由≥目标层级的用户获得（L2奖励只能由L2+用户获得）
         2. 如果第N层用户不满足星级，则向上寻找该层的"替代者"
         3. 防止低层级用户获得高层级奖励（如L1用户拿L2奖励）
@@ -996,6 +996,7 @@ class FinanceService:
         业务规则：
         - 推荐奖励：仅首次购买（0星→1星）且直接推荐人≥1星时发放
         - 团队奖励：只为新达到的层级发放，必须由≥目标层级的用户获得
+        - 推荐奖励和团队奖励可同时发放，互不影响
         """
         logger.info(f"开始发放奖励: 订单#{order_id}, 购买者={buyer_id}({old_level}→{new_level}星)")
 
@@ -1013,7 +1014,6 @@ class FinanceService:
         # ===================================================
 
         total_distributed = Decimal('0')
-        referral_paid = False  # 防止推荐奖励和团队奖励同时触发
 
         # 1. 推荐奖励（首次购买 + 推荐人必须是星级会员）
         if old_level == 0:  # 只有0星升1星时才发推荐奖励
@@ -1062,18 +1062,11 @@ class FinanceService:
 
                     logger.info(f"推荐奖励发放: 用户{referrer['referrer_id']}({referrer_level}星) +{reward_amount:.2f}")
                     total_distributed += reward_amount
-                    referral_paid = True
                 else:
                     logger.debug(f"推荐人{referrer['referrer_id']}不是星级会员({referrer_level}星)，不发放推荐奖励")
             else:
                 logger.debug("购买者无推荐人，跳过推荐奖励")
 
-        # 2. 团队奖励（只为新达到的层级发放；0→1 也发放），且不与推荐奖励同发
-        if referral_paid:
-            logger.debug("已发放推荐奖励，本次跳过团队奖励")
-            return
-
-        # 继续判断是否提升等级
         # 2. 团队奖励（只为新达到的层级发放；0→1 也发放）
         if new_level <= old_level:
             logger.debug("等级未提升，不产生团队奖励")

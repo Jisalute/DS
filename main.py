@@ -12,7 +12,7 @@ import re
 from core.json_response import DecimalJSONResponse, register_exception_handlers
 from fastapi.staticfiles import StaticFiles
 from core.middleware import setup_cors, setup_static_files, setup_request_id
-from core.security_middleware import setup_security_middleware, OPENAPI_PATH
+OPENAPI_PATH = "/openapi.json"
 from core.health import router as health_router
 from core.config import get_db_config, PIC_PATH, AVATAR_UPLOAD_DIR, UVICORN_PORT, settings
 from core.logging import setup_logging
@@ -237,7 +237,6 @@ app.include_router(pay_bridge_router)
 app.mount("/offline", StaticFiles(directory=str(offline_static_dir)), name="offline_static")
 
 setup_request_id(app)
-setup_security_middleware(app)
 setup_cors(app)
 setup_static_files(app)
 app.include_router(health_router)

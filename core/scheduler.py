@@ -117,6 +117,15 @@ class TaskScheduler:
             replace_existing=True
         )
 
+        # Clean non-public avatar files after review requests expire.
+        self.scheduler.add_job(
+            self.clean_expired_avatar_reviews,
+            CronTrigger(minute="*/10"),
+            id="clean_expired_avatar_reviews",
+            replace_existing=True,
+            coalesce=True,
+        )
+
         self.scheduler.start()
         logger.info("定时任务管理器已启动（当前进程持有锁）")
 
@@ -202,6 +211,17 @@ class TaskScheduler:
             logger.info(f"[定时任务] 清理过期银行卡验证码: {deleted}条")
         except Exception as e:
             logger.error(f"[定时任务] 清理过期验证码失败: {e}")
+
+    def clean_expired_avatar_reviews(self):
+        """Mark expired avatar reviews and remove their pending files."""
+        try:
+            from services.avatar_moderation_service import AvatarModerationService
+
+            deleted = AvatarModerationService.expire_stale()
+            if deleted:
+                logger.info("[定时任务] 清理过期头像审核记录: %s", deleted)
+        except Exception as e:
+            logger.error("[定时任务] 清理过期头像审核失败: %s", e, exc_info=True)
 
     def clean_expired_drafts(self):
         """清理过期草稿"""
