@@ -107,7 +107,7 @@ async def distribute_subsidy(
         force: bool = Query(False, description="强制发放（跳过当日防重复，慎用）"),
         service: FinanceService = Depends(get_finance_service)
 ):
-    """手动触发日补贴发放（每日最多使用补贴池余额的5%）；需管理员鉴权。"""
+    """手动触发日补贴发放（每日最多使用补贴池余额的5%）。"""
     try:
         success = service.distribute_daily_subsidy(force=force)
         if success:
