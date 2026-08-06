@@ -996,6 +996,7 @@ class FinanceService:
         业务规则：
         - 会员商品直推奖励已关闭，仅发放团队奖励
         - 团队奖励：只为新达到的层级发放，必须由≥目标层级的用户获得
+        - 推荐奖励和团队奖励可同时发放，互不影响
         """
         logger.info(f"开始发放奖励: 订单#{order_id}, 购买者={buyer_id}({old_level}→{new_level}星)")
 

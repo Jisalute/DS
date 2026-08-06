@@ -6,7 +6,7 @@ import os
 from dotenv import load_dotenv
 from pathlib import Path
 from urllib.parse import urlparse
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 加载环境变量
@@ -82,6 +82,10 @@ class Settings(BaseSettings):
     WECHAT_WXA_ENV_VERSION: str = "release"
     # 小程序「开发 - 开发管理 - 消息推送」服务器配置中的 Token（明文模式校验 URL 用）
     WECHAT_WXA_MSG_TOKEN: str = ""
+    # 用户头像内容安全审核。生产环境应保持开启，并配置公网 HOST。
+    WECHAT_CONTENT_SECURITY_ENABLED: bool = True
+    WECHAT_CONTENT_SECURITY_SCENE: int = 1
+    AVATAR_REVIEW_TTL_MINUTES: int = Field(default=60, ge=1, le=1440)
 
     # ==================== 微信支付服务商配置（新增）====================
     WECHAT_PAY_SP_MCH_ID: str = ""  # 服务商商户号（平台作为服务商时使用）
@@ -267,6 +271,8 @@ class UnilevelLevel(IntEnum):
 BASE_PIC_DIR: Final[Path] = Path(__file__).resolve().parent.parent / "user_pic"
 AVATAR_UPLOAD_DIR: Final[Path] = BASE_PIC_DIR / "avatars"
 AVATAR_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+AVATAR_PENDING_DIR: Final[Path] = BASE_PIC_DIR / "avatar_pending"
+AVATAR_PENDING_DIR.mkdir(parents=True, exist_ok=True)
 # ==================== 奖励类型 ====================
 class RewardType(StrEnum):
     REFERRAL = 'referral'
