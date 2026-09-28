@@ -36,6 +36,7 @@ from services.finance.discount_helpers import (
     parse_offline_coupon_ids,
     parse_pending_coupon_ids,
 )
+from services.finance.rain_point_policy import calculate_conversion
 
 logger = get_logger(__name__)
 
@@ -2817,7 +2818,7 @@ class FinanceService:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, user_id, amount FROM coupons
+                    SELECT id, user_id, amount, rain_settlement_id FROM coupons
                     WHERE status = %s AND valid_to < %s
                     ORDER BY id
                     """,
@@ -2838,11 +2839,12 @@ class FinanceService:
                     if cur.rowcount == 0:
                         continue
                     if amt > 0:
+                        destination_pool = 'director_pool' if r.get('rain_settlement_id') else 'subsidy_pool'
                         self._add_pool_balance(
                             cur,
-                            'subsidy_pool',
+                            destination_pool,
                             amt,
-                            f"优惠券#{cid}过期未使用，面额归入补贴池",
+                            f"优惠券#{cid}过期未使用，面额归入{destination_pool}",
                             related_user=uid,
                         )
                         cur.execute(
@@ -2866,6 +2868,89 @@ class FinanceService:
             total_amount,
         )
         return {"processed": processed, "total_amount": float(total_amount)}
+
+    def settle_monthly_rain_points(self, settlement_period: Optional[str] = None) -> Dict[str, Any]:
+        """Convert each member's rain-point balance once per month."""
+        from calendar import monthrange
+
+        period = settlement_period or datetime.now().strftime('%Y-%m')
+        try:
+            period_date = datetime.strptime(period, '%Y-%m').date()
+        except ValueError as exc:
+            raise FinanceException("settlement_period must use YYYY-MM") from exc
+        period_end = period_date.replace(day=monthrange(period_date.year, period_date.month)[1])
+
+        processed = 0
+        skipped = 0
+        total_converted = Decimal('0')
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM users WHERE status = 1 ORDER BY id")
+                for row in cur.fetchall() or []:
+                    user_id = int(row['id'])
+                    cur.execute(
+                        "SELECT id, true_total_points FROM users WHERE id = %s FOR UPDATE",
+                        (user_id,),
+                    )
+                    user = cur.fetchone()
+                    if not user:
+                        continue
+                    cur.execute(
+                        "SELECT id FROM rain_point_monthly_settlements WHERE user_id = %s AND settlement_period = %s",
+                        (user_id, period),
+                    )
+                    if cur.fetchone():
+                        skipped += 1
+                        continue
+
+                    balance = Decimal(str(user['true_total_points'] or 0))
+                    amount, mode = calculate_conversion(balance)
+
+                    cur.execute(
+                        """INSERT INTO rain_point_monthly_settlements
+                           (user_id, settlement_period, conversion_mode, rain_points_before, converted_amount)
+                           VALUES (%s, %s, %s, %s, %s)""",
+                        (user_id, period, mode, balance, amount),
+                    )
+                    settlement_id = cur.lastrowid
+                    if amount <= 0:
+                        processed += 1
+                        continue
+
+                    new_balance = balance - amount
+                    cur.execute(
+                        "UPDATE users SET true_total_points = %s WHERE id = %s",
+                        (new_balance, user_id),
+                    )
+                    cur.execute(
+                        """INSERT INTO coupons
+                           (user_id, coupon_type, amount, applicable_product_type, valid_from, valid_to,
+                            status, rain_settlement_id)
+                           VALUES (%s, 'user', %s, 'all', %s, %s, 'unused', %s)""",
+                        (user_id, amount, period_date, period_end, settlement_id),
+                    )
+                    coupon_id = cur.lastrowid
+                    cur.execute(
+                        "UPDATE rain_point_monthly_settlements SET coupon_id = %s WHERE id = %s",
+                        (coupon_id, settlement_id),
+                    )
+                    cur.execute(
+                        """INSERT INTO account_flow
+                           (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
+                           VALUES ('true_total_points', %s, %s, %s, 'expense', %s, NOW())""",
+                        (user_id, -amount, new_balance,
+                         f"rain point monthly conversion: {period}/{mode}/coupon={coupon_id}"),
+                    )
+                    processed += 1
+                    total_converted += amount
+                conn.commit()
+
+        return {
+            'settlement_period': period,
+            'processed': processed,
+            'skipped': skipped,
+            'total_converted': float(total_converted),
+        }
 
     # ----------------------------------
     # 供线下模块调用的快捷接口
