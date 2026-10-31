@@ -5,8 +5,9 @@
 # 3. merchant_points同步支持小数精度处理
 
 import logging
+import hashlib
 import json
-from decimal import Decimal, ROUND_DOWN, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_CEILING, ROUND_FLOOR
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 import time
@@ -18,7 +19,7 @@ from core.config import (
     PLATFORM_MERCHANT_ID, MAX_PURCHASE_PER_DAY, MAX_TEAM_LAYER,
     LOG_FILE, CouponStatus,
 )
-from core.database import get_conn
+from core.database import get_conn, get_db_config_cached
 from core.db_adapter import PyMySQLAdapter
 from core.exceptions import FinanceException, OrderException, InsufficientBalanceException
 from core.logging import get_logger
@@ -42,6 +43,63 @@ from services.finance.durability import begin_request, finish_request, begin_eve
 logger = get_logger(__name__)
 
 
+def _finance_config_object(value):
+    if value is None:
+        return {}
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, ValueError) as exc:
+        raise FinanceException('资金池配置JSON无效') from exc
+    if not isinstance(parsed, dict):
+        raise FinanceException('资金池配置必须是JSON对象')
+    return parsed
+
+
+def _finance_config_ratio(value, name, *, positive=False):
+    try:
+        ratio = Decimal(str(value))
+        if not ratio.is_finite() or ratio < 0 or ratio > 1 or (positive and ratio <= 0):
+            raise ValueError
+        return ratio
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise FinanceException(f'资金池比例无效: {name}') from exc
+
+
+def _update_pool_config(cur, account_type, expression, params=()):
+    # UPDATE uses the current locked row, not a stale application-side JSON snapshot.
+    cur.execute(
+        f"""UPDATE finance_accounts SET config_params={expression}
+            WHERE account_type=%s AND (config_params IS NULL OR JSON_TYPE(config_params)='OBJECT')""",
+        (*params, account_type),
+    )
+    if cur.rowcount == 0:
+        cur.execute("SELECT config_params FROM finance_accounts WHERE account_type=%s FOR UPDATE",
+                    (account_type,))
+        row = cur.fetchone()
+        if not row:
+            raise FinanceException(f'缺少资金池账户 {account_type}')
+        _finance_config_object(row['config_params'])
+
+
+def allocation_config_lock_name(database: str) -> str:
+    if not database:
+        raise FinanceException('缺少数据库名称')
+    return 'ds:alloc:' + hashlib.sha256(database.encode('utf-8')).hexdigest()[:48]
+
+
+_ALLOCATION_DEFAULTS = {
+    'merchant_balance': Decimal('0.80'),
+    'public_welfare': Decimal('0.01'),
+    'maintain_pool': Decimal('0.01'),
+    'subsidy_pool': Decimal('0.12'),
+    'director_pool': Decimal('0.02'),
+    'shop_pool': Decimal('0.01'),
+    'city_pool': Decimal('0.01'),
+    'branch_pool': Decimal('0.005'),
+    'fund_pool': Decimal('0.015'),
+}
+
+
 class FinanceService:
     def get_distribution_platform_rate(self) -> Decimal:
         """平台从分账基数（实付+券，即原价−积分抵扣）上计提的比例，默认 0.20。
@@ -51,34 +109,22 @@ class FinanceService:
         持久化在 finance_accounts.platform_revenue_pool.config_params.distribution_platform_rate。
         """
         default = NOMINAL_SUBPOOL_SLICE
-        try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT config_params FROM finance_accounts WHERE account_type = %s LIMIT 1",
-                        ("platform_revenue_pool",),
-                    )
-                    row = cur.fetchone()
-                    if not row or not row.get("config_params"):
-                        return default
-                    cp = row["config_params"]
-                    if isinstance(cp, str):
-                        parsed = json.loads(cp)
-                    else:
-                        parsed = cp or {}
-                    if not isinstance(parsed, dict):
-                        return default
-                    raw = parsed.get("distribution_platform_rate")
-                    if raw is None or raw == "":
-                        return default
-                    d = Decimal(str(raw)).quantize(Decimal("0.000001"))
-                    if d <= Decimal("0") or d > Decimal("1"):
-                        logger.warning('finance_operation_warning')
-                        return default
-                    return d
-        except Exception as e:
-            logger.debug('finance_operation_detail')
-            return default
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT config_params FROM finance_accounts WHERE account_type = %s LIMIT 1",
+                    ("platform_revenue_pool",),
+                )
+                row = cur.fetchone()
+                parsed = _finance_config_object(row.get('config_params') if row else None)
+                if 'distribution_platform_rate' not in parsed:
+                    return default
+                ratio = _finance_config_ratio(parsed['distribution_platform_rate'],
+                                              'distribution_platform_rate', positive=True)
+                ratio = ratio.quantize(Decimal("0.000001"))
+                if ratio <= 0:
+                    raise FinanceException('资金池比例无效: distribution_platform_rate')
+                return ratio
 
     def set_distribution_platform_rate(self, rate: Decimal) -> Decimal:
         """手动设置平台计提比例（相对分账基数）。合法范围 (0, 1]，建议不超过 0.5。"""
@@ -90,28 +136,9 @@ class FinanceService:
 
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, config_params FROM finance_accounts WHERE account_type = %s LIMIT 1",
-                    ("platform_revenue_pool",),
-                )
-                row = cur.fetchone()
-                if not row:
-                    raise FinanceException("缺少 platform_revenue_pool 账户行，请先初始化 finance_accounts")
-                cp = row.get("config_params")
-                try:
-                    if isinstance(cp, str):
-                        parsed = json.loads(cp) if cp else {}
-                    else:
-                        parsed = cp or {}
-                    if not isinstance(parsed, dict):
-                        parsed = {}
-                except (TypeError, json.JSONDecodeError):
-                    parsed = {}
-                parsed["distribution_platform_rate"] = str(d)
-                cur.execute(
-                    "UPDATE finance_accounts SET config_params = %s WHERE id = %s",
-                    (json.dumps(parsed, ensure_ascii=False), row["id"]),
-                )
+                _update_pool_config(cur, 'platform_revenue_pool',
+                    "JSON_SET(COALESCE(config_params,JSON_OBJECT()), '$.distribution_platform_rate', %s)",
+                    (str(d),))
             conn.commit()
         logger.info('finance_operation_state')
         return d
@@ -160,28 +187,9 @@ class FinanceService:
 
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, config_params FROM finance_accounts WHERE account_type = %s LIMIT 1",
-                    ("platform_revenue_pool",),
-                )
-                row = cur.fetchone()
-                if not row:
-                    raise FinanceException("缺少 platform_revenue_pool 账户行，请先初始化 finance_accounts")
-                cp = row.get("config_params")
-                try:
-                    if isinstance(cp, str):
-                        parsed = json.loads(cp) if cp else {}
-                    else:
-                        parsed = cp or {}
-                    if not isinstance(parsed, dict):
-                        parsed = {}
-                except (TypeError, json.JSONDecodeError):
-                    parsed = {}
-                parsed["direct_referral_reward_rate"] = str(d)
-                cur.execute(
-                    "UPDATE finance_accounts SET config_params = %s WHERE id = %s",
-                    (json.dumps(parsed, ensure_ascii=False), row["id"]),
-                )
+                _update_pool_config(cur, 'platform_revenue_pool',
+                    "JSON_SET(COALESCE(config_params,JSON_OBJECT()), '$.direct_referral_reward_rate', %s)",
+                    (str(d),))
             conn.commit()
         logger.info('finance_operation_state')
         return d
@@ -247,39 +255,35 @@ class FinanceService:
             logger.error('finance_operation_failed')
             return Decimal('0')
 
-    def _grant_referral_points(self, cur, referrer_id: int, amount: Decimal, order_no: str):
-        """
-        向推荐人发放推荐奖励点数（referral_points 和 true_total_points）
-        """
+    def _grant_referral_points(self, cur, referrer_id: int, amount: Decimal, order_no: str,
+                               remark: Optional[str] = None):
+        """Grant and persist the exact credited amount in the settlement transaction."""
         if amount <= 0:
             return
-
-        # 更新 referral_points
-        cur.execute(
-            "UPDATE users SET referral_points = COALESCE(referral_points, 0) + %s WHERE id = %s",
-            (amount, referrer_id)
-        )
-        # 更新 true_total_points
-        cur.execute(
-            "UPDATE users SET true_total_points = true_total_points + %s WHERE id = %s",
-            (amount, referrer_id)
-        )
-
-        # 查询当前 referral_points 余额（用于流水）
-        cur.execute(
-            "SELECT COALESCE(referral_points, 0) AS balance FROM users WHERE id = %s",
-            (referrer_id,)
-        )
-        new_balance = Decimal(str(cur.fetchone()['balance'] or 0))
-
-        # 记录 account_flow
-        cur.execute(
-            """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after,
-               flow_type, remark, created_at)
-               VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-            ('referral_points', referrer_id, amount, new_balance, 'income',
-             f"普通商品推荐奖励 - 订单{order_no}")
-        )
+        cur.execute("SELECT id FROM orders WHERE order_number=%s", (order_no,))
+        order = cur.fetchone()
+        if not order:
+            raise FinanceException('推荐奖励订单不存在')
+        cur.execute("SELECT referral_points,true_total_points FROM users WHERE id=%s FOR UPDATE", (referrer_id,))
+        before = cur.fetchone()
+        if not before:
+            raise FinanceException('推荐奖励用户不存在')
+        cur.execute("""UPDATE users SET referral_points=COALESCE(referral_points,0)+%s,
+                       true_total_points=COALESCE(true_total_points,0)+%s WHERE id=%s""",
+                    (amount, amount, referrer_id))
+        cur.execute("SELECT referral_points,true_total_points FROM users WHERE id=%s", (referrer_id,))
+        after = cur.fetchone()
+        credited = Decimal(str(after['referral_points'])) - Decimal(str(before['referral_points'] or 0))
+        available_credit = Decimal(str(after['true_total_points'])) - Decimal(str(before['true_total_points'] or 0))
+        if credited != available_credit or credited < 0:
+            raise FinanceException('推荐奖励实际入账金额不一致')
+        cur.execute("""INSERT INTO account_flow (account_type, related_user, change_amount, balance_after,
+                       flow_type, remark, created_at) VALUES (%s,%s,%s,%s,%s,%s,NOW())""",
+                    ('referral_points', referrer_id, credited, after['referral_points'], 'income',
+                     remark or f"普通商品推荐奖励 - 订单{order_no}"))
+        flow_id = cur.lastrowid
+        cur.execute("""INSERT INTO referral_reward_grants(flow_id,order_id,recipient_id,amount)
+                       VALUES(%s,%s,%s,%s)""", (flow_id, order['id'], referrer_id, credited))
 
         logger.info('finance_operation_state')
 
@@ -1029,31 +1033,13 @@ class FinanceService:
                 if referrer_level >= 1:
                     reward_amount = single_price * self.get_direct_referral_reward_rate()
 
-                    # 发放到 referral_points
-                    cur.execute(
-                        "UPDATE users SET referral_points = COALESCE(referral_points, 0) + %s WHERE id = %s",
-                        (reward_amount, referrer['referrer_id'])
-                    )
-                    # 更新 true_total_points
-                    cur.execute(
-                        "UPDATE users SET true_total_points = true_total_points + %s WHERE id = %s",
-                        (reward_amount, referrer['referrer_id'])
-                    )
-
-                    # 记录流水
-                    cur.execute(
-                        "SELECT COALESCE(referral_points, 0) AS referral_points FROM users WHERE id = %s",
-                        (referrer['referrer_id'],)
-                    )
-                    new_balance = Decimal(str(cur.fetchone()['referral_points'] or 0))
-
-                    cur.execute(
-                        """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
-                           flow_type, remark, created_at)
-                           VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-                        ('referral_points', referrer['referrer_id'], reward_amount,
-                         new_balance, 'income', f"推荐奖励 - 订单#{order_id}")
-                    )
+                    cur.execute("SELECT order_number FROM orders WHERE id=%s", (order_id,))
+                    reward_order = cur.fetchone()
+                    if not reward_order:
+                        raise FinanceException('推荐奖励订单不存在')
+                    self._grant_referral_points(
+                        cur, referrer['referrer_id'], reward_amount, reward_order['order_number'],
+                        remark=f"推荐奖励 - 订单#{order_id}")
 
                     logger.info('finance_operation_state')
                     total_distributed += reward_amount
@@ -1309,10 +1295,11 @@ class FinanceService:
                 # 查询奖励流水
                 cur.execute(f"""
                     SELECT af.id, af.related_user as user_id, u.name as user_name,
-                           af.account_type, af.change_amount as points_issued,
+                           af.account_type, COALESCE(g.amount,af.change_amount) as points_issued,
                            af.remark, af.created_at
                     FROM account_flow af
                     JOIN users u ON af.related_user = u.id
+                    LEFT JOIN referral_reward_grants g ON g.flow_id=af.id
                     WHERE {where_sql}
                     ORDER BY af.created_at DESC
                     LIMIT %s
@@ -1380,23 +1367,17 @@ class FinanceService:
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     if points_value is None:
-                        # 取消调整
-                        cur.execute(
-                            "UPDATE finance_accounts SET config_params = NULL WHERE account_type = 'subsidy_pool'"
-                        )
+                        _update_pool_config(cur, 'subsidy_pool',
+                            "JSON_REMOVE(config_params, '$.points_value', '$.auto_clear')")
                         logger.info('finance_operation_state')
                     else:
-                        # 设置调整值
                         value = Decimal(str(points_value))
                         if value < 0 or value > MAX_POINTS_VALUE:
                             raise FinanceException(f"积分值必须在0到{MAX_POINTS_VALUE}之间")
-
-                        import json
-                        config = json.dumps({"points_value": str(value), "auto_clear": auto_clear})
-                        cur.execute(
-                            "UPDATE finance_accounts SET config_params = %s WHERE account_type = 'subsidy_pool'",
-                            (config,)
-                        )
+                        _update_pool_config(cur, 'subsidy_pool',
+                            "JSON_SET(COALESCE(config_params,JSON_OBJECT()), '$.points_value', %s, "
+                            "'$.auto_clear', JSON_EXTRACT(%s,'$'))",
+                            (str(value), json.dumps(bool(auto_clear))))
 
                         logger.info('finance_operation_state')
 
@@ -1505,19 +1486,9 @@ class FinanceService:
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT config_params FROM finance_accounts WHERE account_type = 'subsidy_pool'"
-                    )
-                    row = cur.fetchone()
-                    config = {}
-                    if row and row.get('config_params'):
-                        import json
-                        config = json.loads(row['config_params'])
-                    config['daily_subsidy_ratio'] = str(ratio)
-                    cur.execute(
-                        "UPDATE finance_accounts SET config_params = %s WHERE account_type = 'subsidy_pool'",
-                        (json.dumps(config),)
-                    )
+                    _update_pool_config(cur, 'subsidy_pool',
+                        "JSON_SET(COALESCE(config_params,JSON_OBJECT()), '$.daily_subsidy_ratio', %s)",
+                        (str(ratio),))
                     conn.commit()
                     logger.info('finance_operation_state')
                     return True
@@ -1565,23 +1536,24 @@ class FinanceService:
             return False
 
         # ========== 计算完整的平台总积分（包含商家和平台）==========
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT SUM(COALESCE(member_points, 0)) as total FROM users")
-                total_user_points = Decimal(str(cur.fetchone()['total'] or 0))
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT SUM(COALESCE(member_points, 0)) as total FROM users")
+                    total_user_points = Decimal(str(cur.fetchone()['total'] or 0))
 
-                cur.execute(
-                    "SELECT SUM(COALESCE(merchant_points, 0)) as total FROM users WHERE COALESCE(merchant_points, 0) > 0")
-                total_merchant_points = Decimal(str(cur.fetchone()['total'] or 0))
+                    cur.execute(
+                        "SELECT SUM(COALESCE(merchant_points, 0)) as total FROM users WHERE COALESCE(merchant_points, 0) > 0")
+                    total_merchant_points = Decimal(str(cur.fetchone()['total'] or 0))
 
-                try:
                     cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'company_points'")
                     cp_row = cur.fetchone()
                     company_points_balance = Decimal(str(cp_row['balance'] or 0)) if cp_row else Decimal('0')
-                except Exception:
-                    company_points_balance = Decimal('0')
 
-                total_system_points = total_user_points + total_merchant_points + company_points_balance
+                    total_system_points = total_user_points + total_merchant_points + company_points_balance
+        except Exception:
+            logger.error('finance_operation_failed')
+            return False
 
         if total_system_points <= 0:
             logger.warning('finance_operation_warning')
@@ -1753,6 +1725,7 @@ class FinanceService:
                             logger.info('finance_operation_state')
                     except Exception as e:
                         logger.error('finance_operation_failed')
+                        raise
 
                     conn.commit()
 
@@ -1771,6 +1744,87 @@ class FinanceService:
             return False
 
     @staticmethod
+    def revoke_referral_rewards(cur, order, intent):
+        """Full-refund reconciliation; caller owns the order lock and transaction."""
+        order_no = order['order_number']
+        if begin_event(cur, 'referral_refund', order_no, order_no, {}):
+            return
+        member_remark = f"推荐奖励 - 订单#{order['id']}"
+        legacy_member_remark = f"推荐奖励自动发放（订单#{order['id']}）"
+        normal_remark = f"普通商品推荐奖励 - 订单{order_no}"
+
+        def quarantine(flow_id, reason, prefix):
+            cur.execute("""INSERT IGNORE INTO payment_reconciliation_cases
+                (case_key,order_number,transaction_id,total_fee,refund_no,reason)
+                VALUES(%s,%s,%s,%s,%s,%s)""",
+                (f'{prefix}:{flow_id}', order_no, intent.get('transaction_id'),
+                 intent['total_fee'], intent['out_refund_no'], reason))
+
+        cur.execute("""SELECT g.flow_id,g.recipient_id,g.amount,g.state,
+                              f.related_user,f.account_type,f.flow_type,f.remark,
+                              f.change_amount=CAST(g.amount AS DECIMAL(14,4)) AS amount_matches
+                       FROM referral_reward_grants g
+                       LEFT JOIN account_flow f ON f.id=g.flow_id
+                       WHERE g.order_id=%s ORDER BY g.recipient_id,g.flow_id FOR UPDATE""",
+                    (order['id'],))
+        grants = cur.fetchall()
+        for grant in grants:
+            if grant['state'] != 'granted':
+                continue
+            amount = Decimal(str(grant['amount']))
+            valid = (grant['related_user'] == grant['recipient_id']
+                     and grant['account_type'] == 'referral_points'
+                     and grant['flow_type'] == 'income'
+                     and grant['amount_matches']
+                     and grant['remark'] in (member_remark, normal_remark)
+                     and amount >= 0)
+            if not valid:
+                quarantine(grant['flow_id'], 'referral_record_mismatch', 'referral-grant')
+                cur.execute("UPDATE referral_reward_grants SET state='manual' WHERE flow_id=%s", (grant['flow_id'],))
+                continue
+            cur.execute("SELECT referral_points,true_total_points FROM users WHERE id=%s FOR UPDATE", (grant['recipient_id'],))
+            recipient = cur.fetchone()
+            if (not recipient or Decimal(str(recipient['referral_points'] or 0)) < amount
+                    or Decimal(str(recipient['true_total_points'] or 0)) < amount):
+                quarantine(grant['flow_id'], 'referral_insufficient_balance', 'referral-grant')
+                cur.execute("UPDATE referral_reward_grants SET state='manual' WHERE flow_id=%s", (grant['flow_id'],))
+                continue
+            referral_before = Decimal(str(recipient['referral_points'] or 0))
+            available_before = Decimal(str(recipient['true_total_points'] or 0))
+            referral_balance = referral_before - amount
+            available_balance = available_before - amount
+            cur.execute("UPDATE users SET referral_points=%s,true_total_points=%s WHERE id=%s",
+                        (referral_balance, available_balance, grant['recipient_id']))
+            reversal_flow_ids = []
+            if amount:
+                for account, balance in (('referral_points', referral_balance), ('true_total_points', available_balance)):
+                    cur.execute("""INSERT INTO account_flow(account_type,related_user,change_amount,balance_after,flow_type,remark,created_at)
+                                   VALUES(%s,%s,%s,%s,'expense',%s,NOW())""",
+                                (account, grant['recipient_id'], -amount, balance,
+                                 f"退款收回推荐奖励: {order_no} 原流水#{grant['flow_id']}"))
+                    reversal_flow_ids.append(cur.lastrowid)
+            cur.execute("""INSERT INTO referral_reward_reversals
+                (flow_id,order_id,recipient_id,refund_no,change_amount,referral_before,referral_after,
+                 available_before,available_after,referral_flow_id,available_flow_id)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (grant['flow_id'], order['id'], grant['recipient_id'], intent['out_refund_no'],
+                 -amount, referral_before, referral_balance, available_before, available_balance,
+                 reversal_flow_ids[0] if reversal_flow_ids else None,
+                 reversal_flow_ids[1] if reversal_flow_ids else None))
+            cur.execute("""UPDATE referral_reward_grants SET state='recovered',recovered_refund_no=%s,
+                           recovered_at=NOW() WHERE flow_id=%s""", (intent['out_refund_no'], grant['flow_id']))
+
+        # Old flow rows stored only four decimal places; their original credits cannot be reconstructed.
+        cur.execute("""SELECT f.id FROM account_flow f LEFT JOIN referral_reward_grants g ON g.flow_id=f.id
+                       WHERE g.flow_id IS NULL AND f.account_type='referral_points' AND f.flow_type='income'
+                       AND (BINARY f.remark=BINARY %s OR BINARY f.remark=BINARY %s
+                            OR BINARY f.remark=BINARY %s) ORDER BY f.id""",
+                    (member_remark, normal_remark, legacy_member_remark))
+        for flow in cur.fetchall():
+            quarantine(flow['id'], 'referral_legacy_precision', 'referral-legacy')
+        finish_event(cur, 'referral_refund', order_no)
+
+    @staticmethod
     def revoke_order_discounts(order_number: str, external_cur=None) -> None:
         """
         订单退款成功后，回退用户使用的积分和优惠券，并收回因该订单获得的积分。
@@ -1786,7 +1840,8 @@ class FinanceService:
         def _internal(cur):
             # 1. 查询订单信息（锁定行）
             cur.execute("""
-                SELECT id, user_id, pending_points, pending_coupon_ids, status, offline_order_flag
+                SELECT id, user_id, pending_points, pending_coupon_ids, status, offline_order_flag,
+                       refund_no, transaction_id, total_amount
                 FROM orders
                 WHERE order_number = %s
                 FOR UPDATE
@@ -1889,7 +1944,8 @@ class FinanceService:
                 # 查询当前余额
                 cur.execute("SELECT member_points FROM users WHERE id = %s", (user_id,))
                 current_points = Decimal(str(cur.fetchone()['member_points'] or 0))
-                actual_deduct = min(total_granted, current_points)
+                actual_deduct = min(total_granted, max(Decimal('0'), current_points))
+                recovery_log_id = None
                 if actual_deduct > 0:
                     cur.execute("""
                         UPDATE users
@@ -1901,9 +1957,20 @@ class FinanceService:
                         INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
                         VALUES (%s, %s, %s, 'member', %s, %s, NOW())
                     """, (user_id, -actual_deduct, new_balance, f"订单退款收回奖励积分: {order_number}", order_id))
+                    recovery_log_id = cur.lastrowid
                     logger.info('finance_operation_state')
-                else:
-                    logger.warning('finance_operation_warning')
+                shortfall = total_granted - actual_deduct
+                cur.execute("""INSERT INTO order_member_reward_refunds
+                    (order_id,order_number,user_id,refund_no,granted_amount,recovered_amount,shortfall_amount,recovery_log_id)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (order_id, order_number, user_id, order.get('refund_no'), total_granted,
+                     actual_deduct, shortfall, recovery_log_id))
+                if shortfall > 0:
+                    cur.execute("""INSERT IGNORE INTO payment_reconciliation_cases
+                        (case_key,order_number,transaction_id,total_fee,refund_no,reason)
+                        VALUES(%s,%s,%s,%s,%s,'member_reward_shortfall')""",
+                        (f'member-reward:{order_id}', order_number, order.get('transaction_id'),
+                         int(Decimal(str(order.get('total_amount') or 0)) * 100), order.get('refund_no')))
             finish_event(cur, 'discount_refund', order_number)
 
         if external_cur is not None:
@@ -2213,67 +2280,29 @@ class FinanceService:
         - 子池键: Decimal（占比，相对于总订单金额，如 0.01 表示 1%）
         如果数据库中没有配置，返回默认值（与项目原始占比一致）。
         """
-        # 我们按行读取 finance_accounts 中每个子池的 config_params.allocation
-        account_keys = [
-            'merchant_balance', 'public_welfare', 'maintain_pool', 'subsidy_pool',
-            'director_pool', 'shop_pool', 'city_pool', 'branch_pool', 'fund_pool'
-        ]
-        cfg_map: Dict[str, Any] = {}
+        account_keys = list(_ALLOCATION_DEFAULTS)
         with get_conn() as conn:
             with conn.cursor() as cur:
+                placeholders, params_dict = build_in_placeholders(account_keys)
+                params_tuple = tuple(params_dict[f"id{i}"] for i in range(len(account_keys)))
+                cur.execute(
+                    f"SELECT account_type, config_params FROM finance_accounts WHERE account_type IN ({placeholders})",
+                    params_tuple)
+                configs = {row['account_type']: _finance_config_object(row.get('config_params'))
+                           for row in cur.fetchall()}
+        try:
+            return self._validate_allocations(self._pool_allocations_from_configs(configs))
+        except ValueError as exc:
+            raise FinanceException('资金池分配配置无效') from exc
 
-                # 查询表中与我们关心的 account_type 列表匹配的行（使用安全占位符构造）
-                try:
-                    placeholders, params_dict = build_in_placeholders(account_keys)
-                    params_tuple = tuple(params_dict[f"id{i}"] for i in range(len(account_keys)))
-                    cur.execute(
-                        f"SELECT account_type, config_params FROM finance_accounts WHERE account_type IN ({placeholders})",
-                        params_tuple)
-                    rows = cur.fetchall()
-                except Exception as e:
-                    logger.error('finance_operation_failed')
-                    rows = []
-
-                for r in rows:
-                    at = r.get('account_type')
-                    cp = r.get('config_params')
-                    if not cp:
-                        continue
-                    try:
-                        if isinstance(cp, str):
-                            parsed = json.loads(cp)
-                        else:
-                            parsed = cp
-                        # 支持两种存储形态：{"allocation":"0.01"} 或 直接为字符串数值
-                        if isinstance(parsed, dict) and 'allocation' in parsed:
-                            cfg_map[at] = Decimal(str(parsed['allocation']))
-                        else:
-                            # 可能以前误存为单行 allocations_config map
-                            # parsed 可能是 {'city_pool':'0.01',...}
-                            if isinstance(parsed, dict) and at in parsed:
-                                cfg_map[at] = Decimal(str(parsed[at]))
-                    except Exception:
-                        logger.debug('finance_operation_detail')
-
-        # 默认配置（数值为相对于总额的占比）
-        defaults = {
-            'merchant_balance': Decimal('0.80'),
-            'public_welfare': Decimal('0.01'),
-            'maintain_pool': Decimal('0.01'),
-            'subsidy_pool': Decimal('0.12'),
-            'director_pool': Decimal('0.02'),
-            'shop_pool': Decimal('0.01'),
-            'city_pool': Decimal('0.01'),
-            'branch_pool': Decimal('0.005'),
-            'fund_pool': Decimal('0.015')
-        }
-
-        # 用读取到的行优先覆盖默认值
-        result: Dict[str, Decimal] = defaults.copy()
-        for k in defaults.keys():
-            if k in cfg_map:
-                result[k] = cfg_map[k]
-
+    @staticmethod
+    def _pool_allocations_from_configs(configs):
+        result = _ALLOCATION_DEFAULTS.copy()
+        for account, parsed in configs.items():
+            if 'allocation' in parsed:
+                result[account] = _finance_config_ratio(parsed['allocation'], account)
+            elif account in parsed:
+                result[account] = _finance_config_ratio(parsed[account], account)
         return result
 
     def _validate_allocations(self, allocs: Dict[str, Any]) -> Dict[str, Decimal]:
@@ -2291,7 +2320,7 @@ class FinanceService:
                 dec = Decimal(str(v))
             except Exception:
                 raise ValueError(f"资金池比例必须是数值: {k}")
-            if dec < 0 or dec > 1:
+            if not dec.is_finite() or dec < 0 or dec > 1:
                 raise ValueError(f"资金池比例范围必须在 0..1 之间: {k}")
             out[k] = dec
 
@@ -2316,42 +2345,62 @@ class FinanceService:
         """
         normalized = self._validate_allocations(allocations)
 
-        # 将每个 allocation 写入对应的 finance_accounts 行的 config_params 字段
-        with get_conn() as conn:
+        # A dedicated physical connection ensures a failed RELEASE_LOCK cannot return
+        # a named-lock-owning session to the shared pool.
+        conn = pymysql.connect(**get_db_config_cached(), cursorclass=pymysql.cursors.DictCursor,
+                               autocommit=False)
+        acquired = False
+        lock_name = None
+        try:
             with conn.cursor() as cur:
+                cur.execute("SELECT DATABASE() AS database_name")
+                database = cur.fetchone()['database_name']
+                lock_name = allocation_config_lock_name(database)
+                cur.execute("SELECT GET_LOCK(%s, %s) AS acquired", (lock_name, 5))
+                lock_row = cur.fetchone()
+                if not lock_row or lock_row['acquired'] != 1:
+                    raise FinanceException('资金池配置写入锁不可用')
+                acquired = True
+                account_keys = list(_ALLOCATION_DEFAULTS)
+                placeholders, params_dict = build_in_placeholders(account_keys)
+                params = tuple(params_dict[f"id{i}"] for i in range(len(account_keys)))
+                cur.execute(f"SELECT account_type, config_params FROM finance_accounts WHERE account_type IN ({placeholders})",
+                            params)
+                configs = {row['account_type']: _finance_config_object(row.get('config_params'))
+                           for row in cur.fetchall()}
+                missing = sorted(set(account_keys) - set(configs))
+                if missing:
+                    raise FinanceException(f'缺少资金池账户 {missing[0]}，请先初始化')
+                try:
+                    self._validate_allocations(self._pool_allocations_from_configs(configs))
+                except ValueError as exc:
+                    raise FinanceException('现有资金池分配配置无效，需人工修复') from exc
                 for atype, dec in normalized.items():
-                    try:
-                        cur.execute("SELECT id, config_params FROM finance_accounts WHERE account_type=%s LIMIT 1",
-                                    (atype,))
-                        row = cur.fetchone()
-                        new_cp = None
-                        if row:
-                            cp = row.get('config_params')
-                            try:
-                                if isinstance(cp, str):
-                                    parsed = json.loads(cp)
-                                else:
-                                    parsed = cp or {}
-                            except Exception:
-                                parsed = {}
-                            if not isinstance(parsed, dict):
-                                parsed = {}
-                            parsed['allocation'] = str(dec)
-                            new_cp = json.dumps(parsed, ensure_ascii=False)
-                            cur.execute("UPDATE finance_accounts SET config_params=%s WHERE id=%s", (new_cp, row['id']))
-                        else:
-                            # account_type 不存在则插入新行
-                            parsed = {'allocation': str(dec)}
-                            cur.execute(
-                                "INSERT INTO finance_accounts(account_name, account_type, balance, config_params) VALUES (%s,%s,%s,%s)",
-                                (atype, atype, 0, json.dumps(parsed, ensure_ascii=False))
-                            )
-                    except Exception as e:
-                        logger.error('finance_operation_failed')
+                    configs[atype]['allocation'] = str(dec)
+                result = self._validate_allocations(self._pool_allocations_from_configs(configs))
+                for atype, dec in sorted(normalized.items()):
+                    cur.execute("""UPDATE finance_accounts
+                        SET config_params=JSON_SET(COALESCE(config_params,JSON_OBJECT()), '$.allocation', %s)
+                        WHERE account_type=%s""", (str(dec), atype))
+                    if cur.rowcount == 0:
+                        cur.execute("SELECT account_type FROM finance_accounts WHERE account_type=%s FOR UPDATE", (atype,))
+                        if not cur.fetchone():
+                            raise FinanceException(f'缺少资金池账户 {atype}，请先初始化')
                 conn.commit()
-
-        # 返回最新的合并配置（读取每行）
-        return self.get_pool_allocations()
+                return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                if acquired:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT RELEASE_LOCK(%s) AS released", (lock_name,))
+                        row = cur.fetchone()
+                        if not row or row['released'] != 1:
+                            raise FinanceException('资金池配置写入锁释放失败')
+            finally:
+                conn.close()
 
     def get_public_welfare_flow(self, limit: int = 50) -> List[Dict[str, Any]]:
         with get_conn() as conn:
@@ -3163,9 +3212,8 @@ class FinanceService:
                 with conn.cursor() as cur:
                     if amount_per_weight is None:
                         # 取消调整
-                        cur.execute(
-                            "UPDATE finance_accounts SET config_params = NULL WHERE account_type = 'director_pool'"
-                        )
+                        _update_pool_config(cur, 'director_pool',
+                            "JSON_REMOVE(config_params, '$.fixed_amount_per_weight')")
                         result["message"] = "已取消联创分红手动调整，恢复自动计算"
                         logger.info('finance_operation_state')
                     else:
@@ -3218,12 +3266,9 @@ class FinanceService:
                             logger.warning('finance_operation_warning')
                         # ===================================================================
 
-                        import json
-                        config = json.dumps({"fixed_amount_per_weight": str(amount)})
-                        cur.execute(
-                            "UPDATE finance_accounts SET config_params = %s WHERE account_type = 'director_pool'",
-                            (config,)
-                        )
+                        _update_pool_config(cur, 'director_pool',
+                            "JSON_SET(COALESCE(config_params,JSON_OBJECT()), '$.fixed_amount_per_weight', %s)",
+                            (str(amount),))
                         result["message"] = f"联创分红金额已调整为: ¥{amount:.4f}/权重"
                         logger.info('finance_operation_state')
 
@@ -4006,10 +4051,11 @@ class FinanceService:
                 offset = (page - 1) * page_size
                 detail_sql = f"""
                     SELECT af.id, af.related_user as user_id, u.name as user_name,
-                           af.change_amount as points_issued, af.remark,
+                           COALESCE(g.amount,af.change_amount) as points_issued, af.remark,
                            af.created_at, u.referral_points as current_points
                     FROM account_flow af
                     JOIN users u ON af.related_user = u.id
+                    LEFT JOIN referral_reward_grants g ON g.flow_id=af.id
                     WHERE {where_sql}
                     ORDER BY af.created_at DESC
                     LIMIT %s OFFSET %s
@@ -4077,7 +4123,7 @@ class FinanceService:
                 offset = (page - 1) * page_size
                 detail_sql = f"""
                     SELECT af.id, af.related_user as user_id, u.name as user_name,
-                           af.account_type, af.change_amount as points_issued,
+                           af.account_type, COALESCE(g.amount,af.change_amount) as points_issued,
                            af.remark, af.created_at,
                            CASE af.account_type 
                              WHEN 'referral_points' THEN u.referral_points 
@@ -4086,6 +4132,7 @@ class FinanceService:
                            END as current_points
                     FROM account_flow af
                     JOIN users u ON af.related_user = u.id
+                    LEFT JOIN referral_reward_grants g ON g.flow_id=af.id
                     WHERE {where_sql}
                     ORDER BY af.created_at DESC
                     LIMIT %s OFFSET %s
@@ -4098,9 +4145,10 @@ class FinanceService:
                 summary_sql = f"""
                     SELECT 
                         COUNT(*) as total_records,
-                        SUM(CASE WHEN account_type = 'referral_points' THEN change_amount ELSE 0 END) as total_referral_points,
-                        SUM(CASE WHEN account_type = 'team_reward_points' THEN change_amount ELSE 0 END) as total_team_points
+                        SUM(CASE WHEN af.account_type = 'referral_points' THEN COALESCE(g.amount,af.change_amount) ELSE 0 END) as total_referral_points,
+                        SUM(CASE WHEN af.account_type = 'team_reward_points' THEN af.change_amount ELSE 0 END) as total_team_points
                     FROM account_flow af
+                    LEFT JOIN referral_reward_grants g ON g.flow_id=af.id
                     WHERE {where_sql}
                 """
                 cur.execute(summary_sql, tuple(params[:-2]))
@@ -5937,14 +5985,17 @@ class FinanceService:
                     # account_type: referral_points, team_reward_points, honor_director, true_total_points
                     cur.execute(f"""
                         SELECT 
-                            related_user,
-                            account_type,
-                            SUM(CASE WHEN flow_type = 'income' THEN change_amount ELSE 0 END) as total_income,
-                            SUM(CASE WHEN flow_type = 'expense' THEN change_amount ELSE 0 END) as total_expense
-                        FROM account_flow
-                        WHERE related_user IN ({placeholders})
-                            AND account_type IN ('referral_points', 'team_reward_points', 'honor_director', 'true_total_points')
-                        GROUP BY related_user, account_type
+                            af.related_user,
+                            af.account_type,
+                            SUM(CASE WHEN af.flow_type = 'income' THEN COALESCE(g.amount,af.change_amount) ELSE 0 END) as total_income,
+                            SUM(CASE WHEN af.flow_type = 'expense' THEN COALESCE(rr.change_amount,ra.change_amount,af.change_amount) ELSE 0 END) as total_expense
+                        FROM account_flow af
+                        LEFT JOIN referral_reward_grants g ON g.flow_id=af.id
+                        LEFT JOIN referral_reward_reversals rr ON rr.referral_flow_id=af.id
+                        LEFT JOIN referral_reward_reversals ra ON ra.available_flow_id=af.id
+                        WHERE af.related_user IN ({placeholders})
+                            AND af.account_type IN ('referral_points', 'team_reward_points', 'honor_director', 'true_total_points')
+                        GROUP BY af.related_user, af.account_type
                     """, params_tuple)
 
                     for row in cur.fetchall():
@@ -6232,14 +6283,15 @@ class FinanceService:
                     params_tuple = tuple(params_dict[f"id{i}"] for i in range(len(user_ids)))
                     cur.execute(f"""
                         SELECT 
-                            related_user,
-                            account_type,
-                            COALESCE(SUM(change_amount), 0) as total_income
-                        FROM account_flow
-                        WHERE related_user IN ({placeholders})
-                            AND account_type IN ('referral_points', 'team_reward_points')
-                            AND flow_type = 'income'
-                        GROUP BY related_user, account_type
+                            af.related_user,
+                            af.account_type,
+                            COALESCE(SUM(COALESCE(g.amount,af.change_amount)), 0) as total_income
+                        FROM account_flow af
+                        LEFT JOIN referral_reward_grants g ON g.flow_id=af.id
+                        WHERE af.related_user IN ({placeholders})
+                            AND af.account_type IN ('referral_points', 'team_reward_points')
+                            AND af.flow_type = 'income'
+                        GROUP BY af.related_user, af.account_type
                     """, params_tuple)
 
                     for row in cur.fetchall():
@@ -6382,7 +6434,8 @@ class FinanceService:
                         m.remark,
                         m.sort_at AS created_at,
                         m.wsr_points_before,
-                        m.flow_src
+                        m.flow_src,
+                        m.is_referral_reversal
                     FROM (
                         SELECT
                             CONCAT('af_', af.id) AS flow_id,
@@ -6391,14 +6444,18 @@ class FinanceService:
                             af.related_user AS user_id,
                             u.name AS user_name,
                             af.account_type,
-                            af.change_amount,
-                            af.balance_after,
+                            COALESCE(g.amount,rr.change_amount,ra.change_amount,af.change_amount) AS change_amount,
+                            COALESCE(rr.referral_after,ra.available_after,af.balance_after) AS balance_after,
                             af.flow_type,
                             af.remark,
                             af.created_at AS sort_at,
-                            CAST(NULL AS DECIMAL(20, 4)) AS wsr_points_before
+                            CAST(NULL AS DECIMAL(20, 4)) AS wsr_points_before,
+                            (rr.flow_id IS NOT NULL OR ra.flow_id IS NOT NULL) AS is_referral_reversal
                         FROM account_flow af
                         JOIN users u ON af.related_user = u.id
+                        LEFT JOIN referral_reward_grants g ON g.flow_id=af.id
+                        LEFT JOIN referral_reward_reversals rr ON rr.referral_flow_id=af.id
+                        LEFT JOIN referral_reward_reversals ra ON ra.available_flow_id=af.id
                         {account_where}
                         UNION ALL
                         SELECT
@@ -6413,7 +6470,8 @@ class FinanceService:
                             'income',
                             NULL AS remark,
                             CAST(wsr.week_start AS DATETIME) AS sort_at,
-                            wsr.points_before
+                            wsr.points_before,
+                            0
                         FROM weekly_subsidy_records wsr
                         JOIN users u ON wsr.user_id = u.id
                         {wsr_where}
@@ -6450,14 +6508,17 @@ class FinanceService:
                 # account_flow 汇总
                 summary_af_sql = f"""
                     SELECT 
-                        SUM(CASE WHEN flow_type = 'income' THEN change_amount ELSE 0 END) as total_income,
-                        SUM(CASE WHEN flow_type = 'expense' THEN change_amount ELSE 0 END) as total_expense,
-                        SUM(CASE WHEN account_type = 'subsidy_points' THEN change_amount ELSE 0 END) as total_subsidy,
-                        SUM(CASE WHEN account_type = 'referral_points' THEN change_amount ELSE 0 END) as total_referral,
-                        SUM(CASE WHEN account_type = 'team_reward_points' THEN change_amount ELSE 0 END) as total_team,
-                        SUM(CASE WHEN account_type = 'honor_director' THEN change_amount ELSE 0 END) as total_unilevel,
-                        SUM(CASE WHEN account_type = 'true_total_points' THEN change_amount ELSE 0 END) as total_coupon_deduction
+                        SUM(CASE WHEN af.flow_type = 'income' THEN COALESCE(g.amount,rr.change_amount,ra.change_amount,af.change_amount) ELSE 0 END) as total_income,
+                        SUM(CASE WHEN af.flow_type = 'expense' THEN COALESCE(g.amount,rr.change_amount,ra.change_amount,af.change_amount) ELSE 0 END) as total_expense,
+                        SUM(CASE WHEN af.account_type = 'subsidy_points' THEN COALESCE(g.amount,rr.change_amount,ra.change_amount,af.change_amount) ELSE 0 END) as total_subsidy,
+                        SUM(CASE WHEN af.account_type = 'referral_points' THEN COALESCE(g.amount,rr.change_amount,ra.change_amount,af.change_amount) ELSE 0 END) as total_referral,
+                        SUM(CASE WHEN af.account_type = 'team_reward_points' THEN COALESCE(g.amount,rr.change_amount,ra.change_amount,af.change_amount) ELSE 0 END) as total_team,
+                        SUM(CASE WHEN af.account_type = 'honor_director' THEN COALESCE(g.amount,rr.change_amount,ra.change_amount,af.change_amount) ELSE 0 END) as total_unilevel,
+                        SUM(CASE WHEN af.account_type = 'true_total_points' THEN COALESCE(g.amount,rr.change_amount,ra.change_amount,af.change_amount) ELSE 0 END) as total_coupon_deduction
                     FROM account_flow af
+                    LEFT JOIN referral_reward_grants g ON g.flow_id=af.id
+                    LEFT JOIN referral_reward_reversals rr ON rr.referral_flow_id=af.id
+                    LEFT JOIN referral_reward_reversals ra ON ra.available_flow_id=af.id
                     {account_where}
                 """
                 cur.execute(summary_af_sql, tuple(params_account_flow))
@@ -6489,7 +6550,11 @@ class FinanceService:
                     remark = r.get('remark', '')
 
                     # 智能识别flow_type：如果是true_total_points且remark包含"捐赠"，显示为"用户捐赠"
-                    if account_type == 'true_total_points' and '捐赠' in remark:
+                    if r['is_referral_reversal']:
+                        flow_type_label = '退款收回推荐奖励'
+                        flow_category = '支出'
+                        change_amount = float(r['change_amount'])
+                    elif account_type == 'true_total_points' and '捐赠' in remark:
                         flow_type_label = '用户捐赠'
                         flow_category = '支出'
                         # 确保change_amount为负值

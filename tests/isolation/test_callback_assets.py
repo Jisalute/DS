@@ -116,7 +116,7 @@ def test_signed_payment_failure_replay_and_refund_assets(db, http, users, monkey
             assert cur.fetchone()['status'] == 'refunded'
             cur.execute("SELECT event_kind,COUNT(*) n FROM finance_events WHERE order_number=%s GROUP BY event_kind", (number,))
             events = {row['event_kind']: row['n'] for row in cur.fetchall()}
-            assert events == {'settlement': 1, 'refund_split': 1, 'discount_refund': 1}
+            assert all(events.get(kind) == 1 for kind in ('settlement', 'refund_split', 'discount_refund', 'referral_refund'))
             cur.execute('SELECT account_type,balance FROM finance_accounts')
             after = {row['account_type']: row['balance'] for row in cur.fetchall()}
             assert after == before

@@ -1,5 +1,6 @@
 # api/wechat_pay/routes.py
 from fastapi import APIRouter, Request, HTTPException, Response, Depends
+from pydantic import BaseModel, StrictInt, StrictStr
 from core.auth import get_current_user, is_platform_admin
 from core.wx_pay_client import WeChatPayClient
 from core.config import WECHAT_PAY_API_V3_KEY, POINTS_DISCOUNT_RATE
@@ -282,8 +283,13 @@ async def wechat_refund_notify(request: Request):
     from services.refund_service import RefundService
     try:
         envelope, data = await _verified_notification(request)
-        if not str(envelope.get('event_type', '')).startswith('REFUND.'):
-            raise HTTPException(400, 'Unsupported event')
+        expected_status = {
+            'REFUND.SUCCESS': 'SUCCESS',
+            'REFUND.CLOSED': 'CLOSED',
+            'REFUND.ABNORMAL': 'ABNORMAL',
+        }.get(envelope.get('event_type'))
+        if not expected_status or data.get('refund_status') != expected_status:
+            raise HTTPException(400, 'Refund event and status mismatch')
         RefundService.apply_result(data)
         return Response(status_code=204)
     except HTTPException:
@@ -334,9 +340,33 @@ async def handle_transaction_success(data: dict):
         await _handle_online_pay_success(order_no, transaction_id, amount, data)
 
 
+async def _retry_payment_transaction(operation, order_no, transaction_id, amount, data):
+    # Only a statement deadlock inside our transaction is known to have rolled
+    # it back. Never replay a connection acquisition or uncertain commit.
+    for attempt in range(3):
+        state = {'entered': False, 'committing': False}
+        try:
+            return await operation(order_no, transaction_id, amount, data, state)
+        except pymysql.err.OperationalError as exc:
+            if (not state['entered'] or state['committing'] or not exc.args
+                    or exc.args[0] != 1213 or attempt == 2):
+                raise
+
+
 async def _handle_offline_pay_success(order_no: str, transaction_id: str, amount: int, data: dict):
+    return await _retry_payment_transaction(
+        _offline_pay_success_once, order_no, transaction_id, amount, data)
+
+
+async def _handle_online_pay_success(order_no: str, transaction_id: str, amount: int, data: dict):
+    return await _retry_payment_transaction(
+        _online_pay_success_once, order_no, transaction_id, amount, data)
+
+
+async def _offline_pay_success_once(order_no, transaction_id, amount, data, state):
     from services.offline_service import OfflineService
     with get_conn() as conn:
+        state['entered'] = True
         with conn.cursor() as cur:
             cur.execute('SELECT * FROM offline_order WHERE order_no=%s FOR UPDATE', (order_no,))
             order = cur.fetchone()
@@ -347,6 +377,7 @@ async def _handle_offline_pay_success(order_no: str, transaction_id: str, amount
             if event:
                 if event['transaction_id'] != transaction_id or event['total_fee'] != amount:
                     raise ValueError('Payment identity conflict')
+                state['committing'] = True
                 conn.commit()
                 return
             if order['status'] != 1:
@@ -359,12 +390,14 @@ async def _handle_offline_pay_success(order_no: str, transaction_id: str, amount
             await OfflineService.on_paid(order_no, Decimal(amount)/100,
                 Decimal(str(order.get('coupon_discount') or 0))/100, transaction_id, external_conn=conn)
             cur.execute('INSERT INTO payment_events(event_key,order_number,transaction_id,total_fee) VALUES(%s,%s,%s,%s)', ('pay:' + order_no, order_no, transaction_id, amount))
+            state['committing'] = True
             conn.commit()
 
 
-async def _handle_online_pay_success(order_no: str, transaction_id: str, amount: int, data: dict):
+async def _online_pay_success_once(order_no, transaction_id, amount, data, state):
     from services.finance_service import FinanceService
     with get_conn() as conn:
+        state['entered'] = True
         with conn.cursor() as cur:
             cur.execute('SELECT * FROM orders WHERE order_number=%s FOR UPDATE', (order_no,))
             order = cur.fetchone()
@@ -375,10 +408,12 @@ async def _handle_online_pay_success(order_no: str, transaction_id: str, amount:
             if event:
                 if event['transaction_id'] != transaction_id or event['total_fee'] != amount:
                     raise ValueError('Payment identity conflict')
+                state['committing'] = True
                 conn.commit()
                 return
             if order['status'] != 'pending_pay':
                 cur.execute("INSERT INTO payment_reconciliation_cases(case_key,order_number,transaction_id,total_fee,reason) VALUES(%s,%s,%s,%s,'paid_after_local_close') ON DUPLICATE KEY UPDATE case_key=case_key", ('late:' + transaction_id, order_no, transaction_id, amount))
+                state['committing'] = True
                 conn.commit()
                 logger.error('payment_reconciliation_required')
                 raise ValueError('Payment quarantined; operator reconciliation required')
@@ -387,25 +422,25 @@ async def _handle_online_pay_success(order_no: str, transaction_id: str, amount:
                 points_to_use=order.get('pending_points') or 0, coupon_discount=order.get('coupon_discount') or 0,
                 external_conn=conn)
             cur.execute('INSERT INTO payment_events(event_key,order_number,transaction_id,total_fee) VALUES(%s,%s,%s,%s)', ('pay:' + order_no, order_no, transaction_id, amount))
+            state['committing'] = True
             conn.commit()
 
-@router.post("/refund", summary="申请订单退款")
+class DirectRefundRequest(BaseModel):
+    order_number: StrictStr
+    refund_fee: StrictInt | None = None
+    reason: StrictStr = ""
+    refund_request_id: StrictStr | None = None
+
+
+@router.post("/refund", summary="商户执行订单退款")
 async def create_refund(
-    request: Request,
+    request: DirectRefundRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    主动申请微信退款（支持线上订单）
-    请求体: {
-        "order_number": "订单号",
-        "refund_fee": 100,  # 退款金额（分），可选，默认全额
-        "reason": "退款原因"  # 可选
-    }
-    """
+    """所属商户或管理员执行直接退款；买家应使用退款申请入口。"""
     from services.refund_service import RefundService
-    payload = await request.json()
-    return RefundService.request(payload.get('order_number'), current_user,
-        refund_fee=payload.get('refund_fee'), reason=payload.get('reason', ''), refund_request_id=payload.get('refund_request_id'))
+    return RefundService.request(request.order_number, current_user,
+        refund_fee=request.refund_fee, reason=request.reason, refund_request_id=request.refund_request_id)
 
 # 注册路由函数（原文件末尾已有，保留不变）
 def register_wechat_pay_routes(app):

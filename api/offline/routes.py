@@ -3,7 +3,7 @@ import json
 
 from fastapi import APIRouter, HTTPException, Query, Depends, Request, Response, Body
 from fastapi.responses import HTMLResponse, RedirectResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt, StrictStr
 from typing import List, Optional
 from datetime import datetime
 from typing import Union
@@ -72,7 +72,8 @@ class OrderDetailRsp(BaseModel):
 
 class RefundReq(BaseModel):
     order_no: str
-    refund_amount: Optional[int] = None
+    refund_amount: Optional[StrictInt] = None
+    refund_request_id: Optional[StrictStr] = None
 
 
 # ------------------ 0. 微信支付配置检查 ------------------
@@ -550,7 +551,8 @@ async def refund(
         result = await OfflineService.refund(
             order_no=req.order_no,
             refund_amount=req.refund_amount,
-            user_id=current_user["id"]
+            current_user=current_user,
+            refund_request_id=req.refund_request_id,
         )
         return {"code": 0, "message": "退款受理成功", "data": result}
     except HTTPException:

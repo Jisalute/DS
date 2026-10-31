@@ -18,7 +18,9 @@
 
 工程约束：
 * 所有金额/数量/咯哒值运算使用 `decimal.Decimal`，禁止 float；除法统一 ROUND_HALF_UP 保留 6 位。
-* 事务内加锁顺序固定为：先 `system_pools`，再 `user_assets`，最后业务表（酒坛/挂牌/券批次）。
+* 写事务先持有桥接就绪行共享锁并校验触发器，再按 `system_pools` → `users` → `user_assets` → 业务表加锁
+  （酒坛/挂牌/券批次）。`users` 不能省：镜像触发器与旧业务都是 users → user_assets，
+  漏掉它就会与旧业务形成反向环路而死锁。**禁止**「先锁 user_assets，再回头锁 users」。
 * 券余额、蛋数量等关键字段使用条件 UPDATE（`WHERE balance >= ?`）二次兜底，防止并发超发。
 """
 from __future__ import annotations
@@ -60,6 +62,11 @@ MAX_WINE_JARS_PER_OPERATION = 6
 
 #: 报价有效期
 QUOTE_TTL_MINUTES = 15
+
+#: 全局转券扫描：单批会员数（游标分页，单批只取 user_id，不整表加载）
+SWEEP_BATCH_SIZE = 500
+#: 单次调用批次数上限；达到上限后下次调用从持久游标继续
+SWEEP_MAX_BATCHES = 200
 
 #: 权益类型（与 rights_ledger.asset_type 枚举一致）
 ASSET_POINTS = "points"
@@ -289,8 +296,33 @@ class RightsService:
         return row
 
     @staticmethod
+    def lock_legacy_user(cur, user_id: int) -> Optional[dict]:
+        """加锁顺序第 2 步：锁旧账本会员行（users）。
+
+        为什么必须有这一步
+        ------------------
+        镜像触发器 `trg_users_assets_mirror_update`（migrations/008）的执行路径是
+        「先 `users` 行锁、再 `user_assets` 行锁」，旧业务（下单扣积分、退款、
+        旧券核销……）天然就是这个方向。新代码只要拿到了 `user_assets` 行锁，
+        而旧业务持有同一会员的 `users` 行锁等待 `user_assets`，
+        两边就会互相等待形成环路。因此凡是同时触及两张表的路径，
+        必须在拿 `user_assets` 之前先拿 `users`。
+
+        全库唯一合法顺序：``system_pools → users → user_assets``。
+
+        返回 ``None`` 表示该 user_id 在 users 中不存在（没有行锁可争，
+        顺序约束自然不成立），是否需要报错由调用方决定。
+        """
+        cur.execute("SELECT id FROM users WHERE id = %s FOR UPDATE", (user_id,))
+        return cur.fetchone()
+
+    @staticmethod
     def lock_user_assets(cur, user_id: int) -> dict:
-        """加锁顺序第 2 步：锁会员资产行（user_assets），不存在则先建零值行。"""
+        """加锁顺序第 3 步：锁会员资产行（user_assets），不存在则先建零值行。
+
+        调用前若同一事务还要碰 `users`（包括写积分/雨点、或仅需与旧业务串行），
+        必须先 :meth:`lock_legacy_user`，不得先拿本行锁再回头锁 `users`。
+        """
         cur.execute("INSERT IGNORE INTO user_assets (user_id) VALUES (%s)", (user_id,))
         cur.execute(
             """SELECT user_id, points, rain_balance, coupon_balance, egg_quantity,
@@ -405,6 +437,8 @@ class RightsService:
         """GET /api/v1/rights/me —— 会员权益总览（只读取，不写库）。"""
         with get_conn() as conn:
             with conn.cursor() as cur:
+                from services.legacy_assets_bridge import assert_settlement_ready
+                assert_settlement_ready(cur)
                 cur.execute(
                     """SELECT user_id, points, rain_balance, coupon_balance, egg_quantity,
                               avg_cost_goda_value, goda_coupon_balance
@@ -412,6 +446,8 @@ class RightsService:
                     (user_id,),
                 )
                 assets = cur.fetchone()
+                if assets is None:
+                    raise RightsError(ERR_STATE_CONFLICT, 503, "会员权益资产未就绪，请联系运维对账")
                 cur.execute("SELECT member_level FROM users WHERE id = %s", (user_id,))
                 user_row = cur.fetchone()
                 cur.execute(
@@ -421,15 +457,6 @@ class RightsService:
                 pools = cur.fetchone()
 
         member_level = int((user_row or {}).get("member_level") or 0)
-        zero = Decimal("0")
-        assets = assets or {
-            "points": zero,
-            "rain_balance": zero,
-            "coupon_balance": zero,
-            "egg_quantity": zero,
-            "avg_cost_goda_value": zero,
-            "goda_coupon_balance": zero,
-        }
         unit_value = None
         if pools:
             unit_value = compute_unit_value(pools["pool_coupon_balance"], pools["platform_egg_balance"])
@@ -513,8 +540,20 @@ class RightsService:
     ) -> dict:
         """POST /api/v1/rights/egg-exchanges —— 优惠券兑换咯哒蛋。
 
-        单事务内完成：扣券 → 80% 入底池 / 20% 入补贴池 → 发放咯哒蛋 → 更新加权平均成本 → 写台账。
-        加锁顺序：system_pools → user_assets（全库统一，防死锁）。
+        单事务内完成：扣券 → 80% 入底池 / 20% 入补贴池 → 发放咯哒蛋 → 更新加权平均成本
+        → **判定并执行自动转券** → 写台账 → 写幂等记录 → 一次 commit。
+
+        漏洞 4（兑换与转券的原子性）：
+            转券不再是 commit 之后的第二段事务。兑换把咯哒值推高到触发线时，转券在
+            **同一个 conn.commit() 之前**完成「蛋清零、发咯哒券、底池扣减、回补平台库存、
+            写流水」；其中任何一步异常都会让整个事务回滚，绝不会出现
+            「券已扣、蛋已发、但没转成券」的中间态。
+            `rights_operations.result` 记录的是**最终**状态，客户端用同一幂等键重试时
+            拿到的就是这份最终结果，不会因为重放而再次转券。
+
+        加锁顺序：桥接就绪共享锁 → ``system_pools → users → user_assets``。
+        `users` 这一步不是可选的：镜像触发器与旧业务都是 users → user_assets，
+        漏掉它就会与旧业务形成反向环路。
         """
         quantity = quantize_amount(to_decimal(coupon_quantity, "coupon_quantity"))
         if quantity <= 0:
@@ -526,7 +565,13 @@ class RightsService:
 
         with get_conn() as conn:
             with conn.cursor() as cur:
+                from services.legacy_assets_bridge import assert_settlement_ready
+                assert_settlement_ready(cur)
+                # 加锁顺序不可调换：system_pools → users → user_assets。
+                # users 必须在这里（user_assets 之前）锁住：镜像触发器走的是
+                # users → user_assets，旧业务也是这个方向，漏掉 users 就会形成环路。
                 pools = self.lock_pools(cur)
+                self.lock_legacy_user(cur, user_id)
                 assets = self.lock_user_assets(cur, user_id)
                 if idempotency_key:
                     replay = self._replay_idempotent(cur, user_id, OP_EGG_EXCHANGE, idempotency_key, fingerprint)
@@ -613,13 +658,37 @@ class RightsService:
                 coupon_after = to_decimal(assets["coupon_balance"]) - quantity
                 pool_after = to_decimal(pools["pool_coupon_balance"]) + pool_in
                 egg_inventory_after = to_decimal(pools["platform_egg_balance"]) - eggs
-                unit_after = compute_unit_value(pool_after, egg_inventory_after)
+                valuation_version_after = int(pools["valuation_version"]) + 1
 
                 self._write_ledger(cur, user_id, ASSET_COUPON, EV_COUPON_TO_EGG, -quantity, coupon_after, unit_before, operation_no)
                 self._write_ledger(cur, user_id, ASSET_EGG, EV_EGG_ISSUED, eggs, new_egg_quantity, unit_before, operation_no)
                 self._write_ledger(cur, 0, ASSET_POOL_COUPON, EV_COUPON_TO_EGG, pool_in, pool_after, unit_before, operation_no)
                 self._write_ledger(cur, 0, ASSET_SUBSIDY_COUPON, EV_COUPON_TO_EGG, subsidy_in, to_decimal(pools["subsidy_coupon_balance"]) + subsidy_in, unit_before, operation_no)
                 self._write_ledger(cur, 0, ASSET_PLATFORM_EGG, EV_EGG_ISSUED, -eggs, egg_inventory_after, unit_before, operation_no)
+
+                # ---- 漏洞 4：同一事务内判定并执行转券（commit 之前） ----
+                conversion, conv_state = self._try_auto_convert_locked(
+                    cur,
+                    user_id,
+                    pool_coupon_balance=pool_after,
+                    platform_egg_balance=egg_inventory_after,
+                    total_egg_supply=to_decimal(pools["total_egg_supply"]),
+                    valuation_version=valuation_version_after,
+                    egg_quantity=new_egg_quantity,
+                    avg_cost=new_cost,
+                    goda_coupon_balance=to_decimal(assets["goda_coupon_balance"]),
+                )
+                if conversion is not None:
+                    pool_after = conv_state["pool_coupon_balance"]
+                    egg_inventory_after = conv_state["platform_egg_balance"]
+                    valuation_version_after = conv_state["valuation_version"]
+                    egg_balance_final = conv_state["egg_quantity"]
+                    goda_balance_final = conv_state["goda_coupon_balance"]
+                    unit_after = conv_state["unit_value"]
+                else:
+                    egg_balance_final = new_egg_quantity
+                    goda_balance_final = to_decimal(assets["goda_coupon_balance"])
+                    unit_after = compute_unit_value(pool_after, egg_inventory_after)
 
                 result = {
                     "exchange_id": operation_no,
@@ -631,13 +700,21 @@ class RightsService:
                     "executed_unit_value": format_amount(unit_before),
                     "unit_value_after": format_amount(unit_after),
                     "avg_cost_goda_value": format_amount(new_cost),
-                    "egg_quantity_total": format_amount(new_egg_quantity),
+                    # 兑换后、转券前的持仓快照：便于对账时还原中间态
+                    "egg_quantity_after_exchange": format_amount(new_egg_quantity),
+                    # 最终持仓（若本次已转券则为 0）
+                    "egg_quantity_total": format_amount(egg_balance_final),
+                    "goda_coupon_balance": format_amount(goda_balance_final),
                     "coupon_balance_after": format_amount(coupon_after),
                     "valuation_version_before": int(pools["valuation_version"]),
-                    "valuation_version_after": int(pools["valuation_version"]) + 1,
+                    "valuation_version_after": valuation_version_after,
+                    "auto_converted": conversion is not None,
                     "rule_version": RULE_VERSION,
                     "created_at": datetime.now(),
                 }
+                if conversion is not None:
+                    result["auto_conversion"] = conversion
+
                 self._record_operation(
                     cur,
                     operation_no=operation_no,
@@ -650,124 +727,291 @@ class RightsService:
                     pool_in_quantity=pool_in,
                     subsidy_in_quantity=subsidy_in,
                     egg_quantity=eggs,
+                    goda_coupon_quantity=None if conversion is None else to_decimal(conversion["goda_coupon_quantity"]),
                     unit_value_before=unit_before,
                     unit_value_after=unit_after,
                     valuation_version_before=pools["valuation_version"],
-                    valuation_version_after=int(pools["valuation_version"]) + 1,
+                    valuation_version_after=valuation_version_after,
                     payload=_dumps({"coupon_quantity": format_amount(quantity)}),
                     result=_dumps(result),
                     committed_at=datetime.now(),
                 )
+                # 兑换 + 转券一次性提交；此处之后不存在第二段写事务
                 conn.commit()
 
-        conversion = self.maybe_auto_convert(user_id)
-        if conversion:
-            result["auto_conversion"] = conversion
+        if conversion is not None:
+            logger.info(
+                "exchange_with_auto_conversion user=%s exchange=%s eggs=%s goda=%s",
+                user_id, operation_no, conversion["egg_quantity_converted"], conversion["goda_coupon_quantity"],
+            )
         return result
 
     # ---------- 自动转咯哒券（FR-206 / Q4 / Q5） ----------
 
+    def _try_auto_convert_locked(
+        self,
+        cur,
+        user_id: int,
+        *,
+        pool_coupon_balance: Decimal,
+        platform_egg_balance: Decimal,
+        total_egg_supply: Decimal,
+        valuation_version: int,
+        egg_quantity: Decimal,
+        avg_cost: Decimal,
+        goda_coupon_balance: Decimal,
+    ) -> tuple[Optional[dict], Optional[dict]]:
+        """在**已持有** system_pools + users + user_assets 行锁的事务内执行一次转券判定。
+
+        调用方必须保证：pools、users、user_assets 三行都已 FOR UPDATE（顺序不可调换），
+        且传入的是加锁之后的最新快照（exchange_eggs 传入的是本次兑换后的推算值）。
+
+        返回 ``(result, state)``：
+        * ``result`` —— 对外结果字典，未触发时为 None；
+        * ``state``  —— 转券后的 Decimal 快照，供调用方拼装最终响应与幂等记录。
+
+        本方法**不 commit、不回滚**，事务边界完全交给调用方。
+        """
+        if egg_quantity <= 0:
+            return None, None
+        unit_value = compute_unit_value(pool_coupon_balance, platform_egg_balance)
+        if not conversion_triggered(unit_value, avg_cost):
+            return None, None
+
+        goda_quantity = goda_coupons_for_eggs(egg_quantity, unit_value)
+        if goda_quantity <= 0:
+            return None, None
+        if pool_coupon_balance < goda_quantity:
+            # 底池不足：不转换、不透支，留给 sweep_global_auto_conversions 后续重试
+            logger.warning(
+                "auto_conversion_deferred pool_insufficient user=%s need=%s pool=%s",
+                user_id, goda_quantity, pool_coupon_balance,
+            )
+            return None, None
+
+        egg_inventory_after = platform_egg_balance + egg_quantity
+        if egg_inventory_after > total_egg_supply:
+            raise RightsError(ERR_STATE_CONFLICT, 409, "平台咯哒蛋库存超出总量恒定上限")
+
+        operation_no = _new_operation_no("CVT")
+        cur.execute(
+            """UPDATE system_pools
+               SET pool_coupon_balance = pool_coupon_balance - %s,
+                   platform_egg_balance = platform_egg_balance + %s,
+                   valuation_version = valuation_version + 1,
+                   updated_at = NOW()
+               WHERE id = 1 AND pool_coupon_balance >= %s
+                     AND platform_egg_balance + %s <= total_egg_supply""",
+            (goda_quantity, egg_quantity, goda_quantity, egg_quantity),
+        )
+        if cur.rowcount != 1:
+            raise RightsError(ERR_STATE_CONFLICT, 409, "转券时底池状态冲突，请稍后重试")
+
+        goda_after = goda_coupon_balance + goda_quantity
+        cur.execute(
+            """UPDATE user_assets
+               SET egg_quantity = 0,
+                   avg_cost_goda_value = 0,
+                   goda_coupon_balance = goda_coupon_balance + %s,
+                   updated_at = NOW()
+               WHERE user_id = %s AND egg_quantity = %s""",
+            (goda_quantity, user_id, egg_quantity),
+        )
+        if cur.rowcount != 1:
+            raise RightsError(ERR_STATE_CONFLICT, 409, "转券时持仓状态冲突，请稍后重试")
+
+        pool_after = pool_coupon_balance - goda_quantity
+        unit_after = compute_unit_value(pool_after, egg_inventory_after)
+
+        self._write_ledger(cur, user_id, ASSET_EGG, EV_EGG_AUTO_CONVERSION, -egg_quantity, Decimal("0"), unit_value, operation_no)
+        self._write_ledger(cur, 0, ASSET_PLATFORM_EGG, EV_EGG_RETURN_TO_PLATFORM, egg_quantity, egg_inventory_after, unit_value, operation_no)
+        self._write_ledger(cur, 0, ASSET_POOL_COUPON, EV_GODA_COUPON_ISSUED, -goda_quantity, pool_after, unit_value, operation_no)
+        self._write_ledger(cur, user_id, ASSET_GODA_COUPON, EV_GODA_COUPON_ISSUED, goda_quantity, goda_after, unit_value, operation_no)
+
+        result = {
+            "conversion_id": operation_no,
+            "status": "succeeded",
+            "egg_quantity_converted": format_amount(egg_quantity),
+            "goda_coupon_quantity": format_amount(goda_quantity),
+            "cost_basis": format_amount(avg_cost),
+            "unit_value": format_amount(unit_value),
+            "unit_value_after": format_amount(unit_after),
+            "goda_coupon_balance": format_amount(goda_after),
+            "rule_version": RULE_VERSION,
+            "triggered_at": datetime.now(),
+        }
+        self._record_operation(
+            cur,
+            operation_no=operation_no,
+            operation_type=OP_EGG_AUTO_CONVERSION,
+            user_id=user_id,
+            status="succeeded",
+            egg_quantity=egg_quantity,
+            goda_coupon_quantity=goda_quantity,
+            unit_value_before=unit_value,
+            unit_value_after=unit_after,
+            valuation_version_before=valuation_version,
+            valuation_version_after=valuation_version + 1,
+            payload=_dumps({"avg_cost_goda_value": format_amount(avg_cost)}),
+            result=_dumps(result),
+            committed_at=datetime.now(),
+        )
+        state = {
+            "pool_coupon_balance": pool_after,
+            "platform_egg_balance": egg_inventory_after,
+            "valuation_version": valuation_version + 1,
+            "egg_quantity": Decimal("0"),
+            "goda_coupon_balance": goda_after,
+            "unit_value": unit_after,
+        }
+        return result, state
+
     def maybe_auto_convert(self, user_id: int) -> Optional[dict]:
-        """实时监测：实时咯哒值 >= 成本×2 时，蛋清零、按 `蛋数量×实时咯哒值` 发咯哒券。
+        """实时监测单个会员：实时咯哒值 >= 成本×2 时，蛋清零、按 `蛋数量×实时咯哒值` 发咯哒券。
 
         Q5：清零的蛋回补平台库存，底池按发券数量扣减（"转券扣底池"）。
         底池不足时不转换（不产生透支），返回 None 由下一次监测重试。
         本方法自带事务，天然幂等：蛋被清零后数量为 0，不会重复转券。
+        加锁顺序：桥接就绪共享锁 → ``system_pools → users → user_assets``。
         """
         with get_conn() as conn:
             with conn.cursor() as cur:
+                from services.legacy_assets_bridge import assert_settlement_ready
+                assert_settlement_ready(cur)
+                # 加锁顺序不可调换：system_pools → users → user_assets。
+                # users 必须在这里（user_assets 之前）锁住：镜像触发器走的是
+                # users → user_assets，旧业务也是这个方向，漏掉 users 就会形成环路。
                 pools = self.lock_pools(cur)
+                self.lock_legacy_user(cur, user_id)
                 assets = self.lock_user_assets(cur, user_id)
-
-                egg_quantity = to_decimal(assets["egg_quantity"])
-                avg_cost = to_decimal(assets["avg_cost_goda_value"])
-                if egg_quantity <= 0:
-                    return None
-                unit_value = compute_unit_value(pools["pool_coupon_balance"], pools["platform_egg_balance"])
-                if not conversion_triggered(unit_value, avg_cost):
-                    return None
-
-                goda_quantity = goda_coupons_for_eggs(egg_quantity, unit_value)
-                if goda_quantity <= 0:
-                    return None
-                if to_decimal(pools["pool_coupon_balance"]) < goda_quantity:
-                    logger.warning(
-                        "auto_conversion_deferred pool_insufficient user=%s need=%s pool=%s",
-                        user_id, goda_quantity, pools["pool_coupon_balance"],
-                    )
+                result, _state = self._try_auto_convert_locked(
+                    cur,
+                    user_id,
+                    pool_coupon_balance=to_decimal(pools["pool_coupon_balance"]),
+                    platform_egg_balance=to_decimal(pools["platform_egg_balance"]),
+                    total_egg_supply=to_decimal(pools["total_egg_supply"]),
+                    valuation_version=int(pools["valuation_version"]),
+                    egg_quantity=to_decimal(assets["egg_quantity"]),
+                    avg_cost=to_decimal(assets["avg_cost_goda_value"]),
+                    goda_coupon_balance=to_decimal(assets["goda_coupon_balance"]),
+                )
+                if result is None:
                     conn.rollback()
                     return None
-
-                operation_no = _new_operation_no("CVT")
-                egg_inventory_after = to_decimal(pools["platform_egg_balance"]) + egg_quantity
-                if egg_inventory_after > to_decimal(pools["total_egg_supply"]):
-                    raise RightsError(ERR_STATE_CONFLICT, 409, "平台咯哒蛋库存超出总量恒定上限")
-
-                cur.execute(
-                    """UPDATE system_pools
-                       SET pool_coupon_balance = pool_coupon_balance - %s,
-                           platform_egg_balance = platform_egg_balance + %s,
-                           valuation_version = valuation_version + 1,
-                           updated_at = NOW()
-                       WHERE id = 1 AND pool_coupon_balance >= %s
-                             AND platform_egg_balance + %s <= total_egg_supply""",
-                    (goda_quantity, egg_quantity, goda_quantity, egg_quantity),
-                )
-                if cur.rowcount != 1:
-                    raise RightsError(ERR_STATE_CONFLICT, 409, "转券时底池状态冲突，请稍后重试")
-
-                goda_after = to_decimal(assets["goda_coupon_balance"]) + goda_quantity
-                cur.execute(
-                    """UPDATE user_assets
-                       SET egg_quantity = 0,
-                           avg_cost_goda_value = 0,
-                           goda_coupon_balance = goda_coupon_balance + %s,
-                           updated_at = NOW()
-                       WHERE user_id = %s AND egg_quantity = %s""",
-                    (goda_quantity, user_id, egg_quantity),
-                )
-                if cur.rowcount != 1:
-                    raise RightsError(ERR_STATE_CONFLICT, 409, "转券时持仓状态冲突，请稍后重试")
-
-                pool_after = to_decimal(pools["pool_coupon_balance"]) - goda_quantity
-                unit_after = compute_unit_value(pool_after, egg_inventory_after)
-
-                self._write_ledger(cur, user_id, ASSET_EGG, EV_EGG_AUTO_CONVERSION, -egg_quantity, Decimal("0"), unit_value, operation_no)
-                self._write_ledger(cur, 0, ASSET_PLATFORM_EGG, EV_EGG_RETURN_TO_PLATFORM, egg_quantity, egg_inventory_after, unit_value, operation_no)
-                self._write_ledger(cur, 0, ASSET_POOL_COUPON, EV_GODA_COUPON_ISSUED, -goda_quantity, pool_after, unit_value, operation_no)
-                self._write_ledger(cur, user_id, ASSET_GODA_COUPON, EV_GODA_COUPON_ISSUED, goda_quantity, goda_after, unit_value, operation_no)
-
-                result = {
-                    "conversion_id": operation_no,
-                    "status": "succeeded",
-                    "egg_quantity_converted": format_amount(egg_quantity),
-                    "goda_coupon_quantity": format_amount(goda_quantity),
-                    "cost_basis": format_amount(avg_cost),
-                    "unit_value": format_amount(unit_value),
-                    "unit_value_after": format_amount(unit_after),
-                    "goda_coupon_balance": format_amount(goda_after),
-                    "rule_version": RULE_VERSION,
-                    "triggered_at": datetime.now(),
-                }
-                self._record_operation(
-                    cur,
-                    operation_no=operation_no,
-                    operation_type=OP_EGG_AUTO_CONVERSION,
-                    user_id=user_id,
-                    status="succeeded",
-                    egg_quantity=egg_quantity,
-                    goda_coupon_quantity=goda_quantity,
-                    unit_value_before=unit_value,
-                    unit_value_after=unit_after,
-                    valuation_version_before=pools["valuation_version"],
-                    valuation_version_after=int(pools["valuation_version"]) + 1,
-                    payload=_dumps({"avg_cost_goda_value": format_amount(avg_cost)}),
-                    result=_dumps(result),
-                    committed_at=datetime.now(),
-                )
                 conn.commit()
-        logger.info("egg_auto_conversion user=%s eggs=%s goda=%s", user_id, egg_quantity, goda_quantity)
+        logger.info(
+            "egg_auto_conversion user=%s eggs=%s goda=%s",
+            user_id, result["egg_quantity_converted"], result["goda_coupon_quantity"],
+        )
         return result
+
+    def sweep_global_auto_conversions(self, batch_size: int = SWEEP_BATCH_SIZE, max_batches: int = SWEEP_MAX_BATCHES) -> dict:
+        """循环扫描持蛋会员；持久游标跨分页上限与进程重启续扫。
+
+        每圈固定 user_id 上界，完成后从零开始，不依赖估值版本。
+        每个会员仍使用独立短事务；批次处理后以 revision CAS 推进游标。
+        崩溃或 CAS 冲突只会重放已处理会员，清零幂等防止重复发券。
+        失败与未达标会员留在资产表，下一圈重新判定实时估值。
+        """
+        batch = max(1, int(batch_size))
+        limit_rounds = max(1, int(max_batches))
+        scanned = 0
+        converted = 0
+        deferred = 0
+        goda_total = Decimal("0")
+        failures: list[dict] = []
+        rounds = 0
+        cycle_complete = False
+        cursor_conflict = False
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                from services.legacy_assets_bridge import assert_settlement_ready
+                assert_settlement_ready(cur)
+                cur.execute("SELECT * FROM rights_conversion_sweep_state WHERE id = 1 FOR UPDATE")
+                state = cur.fetchone()
+                if not state:
+                    raise RightsError(ERR_STATE_CONFLICT, 503, "转券扫描状态未初始化，请执行迁移")
+                last_user_id = int(state["last_user_id"])
+                upper_user_id = int(state["upper_user_id"])
+                revision = int(state["revision"])
+                if upper_user_id == 0:
+                    cur.execute("SELECT COALESCE(MAX(user_id), 0) AS upper_user_id FROM user_assets")
+                    upper_user_id = int(cur.fetchone()["upper_user_id"])
+                    last_user_id = 0
+                    cur.execute(
+                        """UPDATE rights_conversion_sweep_state
+                           SET last_user_id = 0, upper_user_id = %s, revision = revision + 1
+                           WHERE id = 1""",
+                        (upper_user_id,),
+                    )
+                    revision += 1
+            conn.commit()
+
+        while rounds < limit_rounds:
+            rounds += 1
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    assert_settlement_ready(cur)
+                    cur.execute(
+                        """SELECT user_id FROM user_assets
+                           WHERE egg_quantity > 0 AND user_id > %s AND user_id <= %s
+                           ORDER BY user_id LIMIT %s""",
+                        (last_user_id, upper_user_id, batch),
+                    )
+                    rows = list(cur.fetchall() or [])
+            next_user_id = int(rows[-1]["user_id"]) if rows else last_user_id
+            for row in rows:
+                user_id = int(row["user_id"])
+                scanned += 1
+                try:
+                    result = self.maybe_auto_convert(user_id)
+                except Exception as exc:  # noqa: BLE001 - 单个会员失败不中断整轮扫描
+                    logger.warning("auto_conversion_sweep_user_failed user=%s error_type=%s", user_id, type(exc).__name__)
+                    failures.append({"user_id": user_id, "code": "SWEEP_FAILED", "message": type(exc).__name__})
+                    continue
+                if result is None:
+                    deferred += 1
+                    continue
+                converted += 1
+                goda_total += to_decimal(result["goda_coupon_quantity"])
+
+            cycle_complete = len(rows) < batch or next_user_id >= upper_user_id
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    assert_settlement_ready(cur)
+                    cur.execute(
+                        """UPDATE rights_conversion_sweep_state
+                           SET last_user_id = %s, upper_user_id = %s, revision = revision + 1
+                           WHERE id = 1 AND revision = %s""",
+                        (0 if cycle_complete else next_user_id,
+                         0 if cycle_complete else upper_user_id, revision),
+                    )
+                    cursor_conflict = cur.rowcount != 1
+                conn.commit()
+            if cursor_conflict or cycle_complete:
+                break
+            last_user_id = next_user_id
+            revision += 1
+
+        summary = {
+            "status": "partial" if failures or cursor_conflict or not cycle_complete else "succeeded",
+            "users_scanned": scanned,
+            "users_converted": converted,
+            "users_deferred": deferred,
+            "goda_coupon_issued": format_amount(goda_total),
+            "batches": rounds,
+            "failures": failures,
+            "cycle_complete": cycle_complete and not cursor_conflict,
+            "cursor_conflict": cursor_conflict,
+            "last_user_id": 0 if cycle_complete and not cursor_conflict else last_user_id,
+            "upper_user_id": upper_user_id,
+            "rule_version": RULE_VERSION,
+            "finished_at": datetime.now(),
+        }
+        if converted or failures:
+            logger.info("auto_conversion_sweep %s", summary)
+        return summary
 
     # ---------- 白酒：报价与咯哒券兑换（FR-207 / Q7） ----------
 
@@ -859,7 +1103,13 @@ class RightsService:
         fingerprint = _fingerprint({"listing_id": listing_id, "jars": jars})
         with get_conn() as conn:
             with conn.cursor() as cur:
+                from services.legacy_assets_bridge import assert_settlement_ready
+                assert_settlement_ready(cur)
+                # 加锁顺序不可调换：system_pools → users → user_assets。
+                # users 必须在这里（user_assets 之前）锁住：镜像触发器走的是
+                # users → user_assets，旧业务也是这个方向，漏掉 users 就会形成环路。
                 pools = self.lock_pools(cur)
+                self.lock_legacy_user(cur, user_id)
                 assets = self.lock_user_assets(cur, user_id)
                 if idempotency_key:
                     replay = self._replay_idempotent(cur, user_id, OP_WINE_REDEMPTION, idempotency_key, fingerprint)

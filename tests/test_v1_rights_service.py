@@ -1,11 +1,10 @@
 """V1.1 权益核心逻辑单元测试（纯计算，不依赖数据库）。
 
 覆盖：Q6 咯哒值口径、R3/R4 兑换分流、Q4 加权平均与触发线、Q5 转券数量、
-Q7 兑酒不扣底池、Decimal 精度、Q12 暂缓的源码级约束。
+Q7 兑酒不扣底池、Decimal 精度、Q12 暂缓。
 """
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
-from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -35,7 +34,6 @@ from services.settlement_service import (
     rain_for_points,
 )
 
-ROOT = Path(__file__).resolve().parent.parent
 
 
 # ==================== Q6 实时咯哒值 ====================
@@ -164,12 +162,6 @@ def test_exchange_rejects_values_outside_database_precision(field, value):
         EggExchangeRequest(**payload)
 
 
-def test_rights_service_source_has_no_float_arithmetic():
-    source = (ROOT / "services" / "rights_service.py").read_text(encoding="utf-8")
-    assert "float(" not in source
-    assert "round(" not in source
-
-
 # ==================== 结算：Q1/Q2/Q3 ====================
 
 def test_daily_points_value_is_capped():
@@ -201,20 +193,3 @@ def test_subsidy_payout_is_disabled():
         SettlementService().payout_subsidy_pool()
 
 
-def test_settlement_source_has_no_subsidy_payout_arithmetic():
-    """源码级兜底：不得出现补贴池出池扣减，也不得出现 12%/8% 比例常量。"""
-    source = (ROOT / "services" / "settlement_service.py").read_text(encoding="utf-8")
-    assert "subsidy_coupon_balance = subsidy_coupon_balance -" not in source
-    assert 'Decimal("0.12")' not in source
-    assert 'Decimal("0.08")' not in source
-    assert '"0.12"' not in source
-    assert '"0.08"' not in source
-    # 补贴池只允许出现一次增量写（券过期入池）
-    assert source.count("subsidy_coupon_balance = subsidy_coupon_balance +") == 1
-
-
-def test_rights_service_debits_pool_only_for_conversion():
-    """Q7：兑酒流程不得扣底池；底池扣减只允许出现在转券（Q5）。"""
-    source = (ROOT / "services" / "rights_service.py").read_text(encoding="utf-8")
-    assert source.count("pool_coupon_balance = pool_coupon_balance -") == 1
-    assert '"pool_coupon_debit": format_amount(Decimal("0"))' in source

@@ -995,7 +995,7 @@ class WeChatPayClient:
             'Authorization': self._build_auth_header('POST', url_path, body_str),
             'Content-Type': 'application/json',
             'Accept': 'application/json',
-            'Wechatpay-Serial': self._get_merchant_serial_no()
+            'Wechatpay-Serial': self.pub_key_id
         }
         
         try:
@@ -1003,11 +1003,22 @@ class WeChatPayClient:
             
             logger.info("refund_provider_response status=%s", response.status_code)
             
+            self._verify_refund_response(response)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.HTTPError:
             logger.warning("refund_provider_http_error")
             raise
+    def _verify_refund_response(self, response):
+        headers = response.headers
+        signature = headers.get('Wechatpay-Signature')
+        timestamp = headers.get('Wechatpay-Timestamp')
+        nonce = headers.get('Wechatpay-Nonce')
+        if (not self.pub_key_id or headers.get('Wechatpay-Serial') != self.pub_key_id
+                or not all((signature, timestamp, nonce))
+                or not self.verify_signature(signature, timestamp, nonce, response.content.decode('utf-8'))):
+            raise ValueError('Untrusted refund response')
+
 
     def query_refund(self, out_refund_no: str, sub_mchid: Optional[str] = None):
         from urllib.parse import quote, urlencode
@@ -1016,6 +1027,7 @@ class WeChatPayClient:
             path += '?' + urlencode({'sub_mchid': sub_mchid})
         response = self.session.get(self.BASE_URL + path,
             headers={'Authorization': self._build_auth_header('GET', path), 'Accept': 'application/json'}, timeout=15)
+        self._verify_refund_response(response)
         if response.status_code == 404:
             data = response.json()
             if data.get('code') == 'RESOURCE_NOT_EXISTS':

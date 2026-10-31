@@ -94,6 +94,15 @@ class AuthResp(BaseModel):
     is_new: bool
 
 
+class UserIdentityResp(BaseModel):
+    """Authenticated account identity, represented without JSON integer precision loss."""
+    user_id: str = Field(
+        pattern=r"^[0-9]+$",
+        description="当前已认证账户的十进制用户 ID 字符串",
+        examples=["9007199254740993"],
+    )
+
+
 class UserInfoResp(BaseModel):
     """用户信息响应"""
     uid: int
@@ -130,6 +139,7 @@ class ResetPwdReq(BaseModel):
     """重置密码请求"""
     mobile: str
     sms_code: str = Field(pattern=r"^\d{6}$", description="真实短信验证码，仅最新签发有效")
+    session_id: str = Field(pattern=r"^[0-9a-f]{32}$", description="发送找回短信时返回的挑战标识")
     new_password: str = Field(min_length=8, max_length=72)
 
 

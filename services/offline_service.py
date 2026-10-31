@@ -453,16 +453,21 @@ class OfflineService:
 
     # ---------- 6. 退款 ----------
     @staticmethod
-    async def refund(order_no: str, refund_amount: Optional[int], user_id: int):
+    async def refund(order_no: str, refund_amount: Optional[int], current_user: dict,
+                     refund_request_id: Optional[str] = None):
         from services.refund_service import RefundService
         from core.auth import is_platform_admin
+        from fastapi import HTTPException
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute('SELECT merchant_id FROM offline_order WHERE order_no=%s', (order_no,))
                 row = cur.fetchone()
-                if not row or int(row['merchant_id']) != int(user_id):
-                    raise ValueError('无权退款该订单')
-        return RefundService.request(order_no, {'id': user_id}, refund_fee=refund_amount, audit=False, merchant_address=None, merchant_actor=True)
+                if not row:
+                    raise HTTPException(404, '订单不存在')
+                if not is_platform_admin(current_user) and int(row['merchant_id']) != int(current_user['id']):
+                    raise HTTPException(403, '无权退款该订单')
+        return RefundService.request(order_no, current_user, refund_fee=refund_amount,
+                                     refund_request_id=refund_request_id)
 
     # ---------- 7. 收款码状态 ----------
     @staticmethod

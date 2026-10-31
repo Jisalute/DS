@@ -444,8 +444,8 @@ class DatabaseManager:
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                     user_id BIGINT UNSIGNED NOT NULL,
                     product_id BIGINT UNSIGNED NOT NULL,
-                    sku_id BIGINT UNSIGNED NULL,
-                    quantity INT DEFAULT 1,
+                    sku_id BIGINT UNSIGNED NOT NULL,
+                    quantity INT NOT NULL DEFAULT 1,
                     specifications JSON DEFAULT NULL,
                     selected TINYINT DEFAULT 1,
                     added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -1572,22 +1572,27 @@ class DatabaseManager:
                     cp = row.get('config_params')
                     need_update = False
                     try:
-                        if cp:
+                        if cp is not None:
                             parsed = json.loads(cp) if isinstance(cp, str) else cp
                         else:
                             parsed = {}
                         if not isinstance(parsed, dict):
-                            parsed = {}
-                        if parsed.get('allocation') != str(aval):
+                            raise ValueError('资金池配置必须是JSON对象')
+                        if 'allocation' not in parsed:
                             parsed['allocation'] = str(aval)
                             need_update = True
-                    except Exception:
-                        parsed = {'allocation': str(aval)}
-                        need_update = True
+                    except (TypeError, ValueError):
+                        logger.warning("资金池配置无效，保留原值并等待人工核查: %s", atype)
+                        continue
 
                     if need_update:
-                        cursor.execute("UPDATE finance_accounts SET config_params=%s WHERE id=%s",
-                                       (json.dumps(parsed, ensure_ascii=False), row['id']))
+                        cursor.execute(
+                            """UPDATE finance_accounts
+                               SET config_params=JSON_SET(COALESCE(config_params, JSON_OBJECT()), '$.allocation', %s)
+                               WHERE id=%s AND (config_params IS NULL OR
+                                   (JSON_TYPE(config_params)='OBJECT' AND
+                                    JSON_CONTAINS_PATH(config_params, 'one', '$.allocation')=0))""",
+                            (str(aval), row['id']))
                 else:
                     parsed = {'allocation': str(aval)}
                     cursor.execute(

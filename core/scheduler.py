@@ -106,6 +106,16 @@ class TaskScheduler:
             coalesce=True,
         )
 
+        # 每分钟续扫持久游标；失败和未达标会员在下一圈重新判定。
+        self.scheduler.add_job(
+            self.sweep_v1_auto_conversions,
+            CronTrigger(minute="*"),
+            id="v1_global_auto_conversion",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+
         # 每月1日零点自动发放联创分红
         self.scheduler.add_job(
             self.auto_distribute_unilevel_dividend,
@@ -126,8 +136,7 @@ class TaskScheduler:
         # )
 
         # 每小时清理过期银行卡验证码
-        self.scheduler.add_job(
-            self.clean_expired_bankcard_codes,
+        self.scheduler.add_job(            self.clean_expired_bankcard_codes,
             CronTrigger(hour="*", minute=30),
             id="clean_expired_bankcard_codes",
             replace_existing=True
@@ -174,6 +183,22 @@ class TaskScheduler:
             logger.info("[定时任务] V1.1 会员权益日结完成: %s", summary)
         except Exception as e:
             logger.error("scheduled_v1_daily_settlement_failed: %s", e)
+
+    # ==================== V1.1 全局自动转券（Q4 被动持有人） ====================
+    def sweep_v1_auto_conversions(self):
+        """扫描持有咯哒蛋的会员，逐个执行 Q4 自动转券。
+
+        被动持有人（兑换后再无操作）若不扫描，会长期错失增值转券，
+        因此由调度器每分钟驱动一次；单会员独立短事务，可随时重入。
+        """
+        try:
+            from services.rights_service import RightsService
+
+            summary = RightsService().sweep_global_auto_conversions()
+            if summary["users_converted"] or summary["failures"]:
+                logger.info("[定时任务] V1.1 全局自动转券: %s", summary)
+        except Exception as e:
+            logger.error("scheduled_v1_auto_conversion_failed error_type=%s", type(e).__name__)
 
     # ==================== 日补贴发放（V1.1 已停用） ====================
     def auto_distribute_daily_subsidy(self):

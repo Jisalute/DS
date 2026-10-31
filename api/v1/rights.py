@@ -44,10 +44,11 @@ def _require_idempotency_key(value: Optional[str]) -> Optional[str]:
 )
 def get_my_rights(user: dict = Depends(get_current_user)) -> ApiEnvelope[RightsMeResponse]:
     """返回当前登录会员的积分、雨点、优惠券、咯哒蛋、咯哒券与咯哒值快照。"""
-    data = RightsService().get_my_rights(int(user["id"]))
+    user_id = int(user["id"])
+    data = RightsService().get_my_rights(user_id)
     return ApiEnvelope[RightsMeResponse](
         message="成功",
-        data=RightsMeResponse(**data),
+        data=RightsMeResponse(**{**data, "user_id": str(user_id)}),
         request_id=get_request_id(),
     )
 

@@ -22,11 +22,16 @@ class RefundManager:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT status FROM orders WHERE order_number=%s AND user_id=%s FOR UPDATE",
+                    "SELECT status,refund_no FROM orders WHERE order_number=%s AND user_id=%s FOR UPDATE",
                     (order_number, user_id),
                 )
                 order = cur.fetchone()
-                if not order or order["status"] not in ("pending_ship", "pending_recv", "completed"):
+                if not order:
+                    return False
+                cur.execute("SELECT id FROM payment_refund_intents WHERE order_number=%s LIMIT 1", (order_number,))
+                if order.get("refund_no") or cur.fetchone():
+                    raise HTTPException(409, "订单已有退款记录，申请金额需先对账")
+                if order["status"] not in ("pending_ship", "pending_recv", "completed"):
                     return False
                 select_sql = build_dynamic_select(
                     cur,
@@ -123,9 +128,6 @@ def refund_audit(
 
 @router.get("/progress/{order_number}", summary="查询退款进度")
 def refund_progress(order_number: str, current_user: dict = Depends(get_current_user)):
-    result = RefundManager.progress(order_number) or {}
-    if not result:
-        return {}
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT user_id, merchant_id FROM orders WHERE order_number=%s", (order_number,))
@@ -135,7 +137,7 @@ def refund_progress(order_number: str, current_user: dict = Depends(get_current_
         and int(current_user["id"]) not in {int(order.get("user_id") or 0), int(order.get("merchant_id") or 0)}
     ):
         raise HTTPException(status_code=403, detail="无权查看该退款")
-    return result
+    return RefundManager.progress(order_number) or {}
 
 # ==================== 新增：退款查询接口 ====================
 

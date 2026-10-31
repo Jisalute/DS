@@ -121,6 +121,8 @@ def build_product_dict(product: Dict[str, Any], skus: List[Dict[str, Any]] = Non
                        attributes: List[Dict[str, Any]] = None) -> Dict[str, Any]:
     """从数据库查询结果构建商品字典（pymysql 版本）"""
     base = {col: product.get(col) for col in PRODUCT_COLUMNS}
+    if base.get("id") is not None:
+        base["product_id_str"] = str(base["id"])
     base["skus"] = skus or []
     base["attributes"] = attributes or []
     base["freight"] = 0.00
@@ -152,6 +154,8 @@ def build_product_dict(product: Dict[str, Any], skus: List[Dict[str, Any]] = Non
 
     if base.get("skus"):
         for sku in base["skus"]:
+            if sku.get("id") is not None:
+                sku["sku_id_str"] = str(sku["id"])
             if sku.get("specifications") and isinstance(sku["specifications"], str):
                 try:
                     sku["specifications"] = json.loads(sku["specifications"])

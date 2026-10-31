@@ -41,7 +41,7 @@ def test_reset_single_consumer_and_all_sessions_revoked(http, users, token, db, 
     result = http.post('/user/reset-password/sms', json={'mobile':mobile,'device_id':'synthetic-device-00001'})
     assert result.status_code == 200
     assert 'mock_code' not in result.json()
-    body = {'mobile':mobile,'sms_code':codes[0],'new_password':'New-synthetic-pass-42!'}
+    body = {'mobile':mobile,'session_id':result.json()['session_id'],'sms_code':codes[0],'new_password':'New-synthetic-pass-42!'}
     results = race(lambda: http.post('/user/reset-password',json=body), lambda: http.post('/user/reset-password',json=body))
     assert sorted(r.status_code for r in results) == [200,400]
     for value in tokens:
@@ -61,11 +61,48 @@ def test_attempt_limit_survives_reissue(http, users, db, monkeypatch):
     codes=[]
     monkeypatch.setattr(service,'send_sms',lambda mobile,code,purpose,request_id: codes.append(code) or 'controlled')
     mobile=_mobile(db,users[0])
-    assert http.post('/user/reset-password/sms',json={'mobile':mobile,'device_id':'attempt-device-00001'}).status_code == 200
+    issued=http.post('/user/reset-password/sms',json={'mobile':mobile,'device_id':'attempt-device-00001'})
+    assert issued.status_code == 200
+    session=issued.json()['session_id']
     for _ in range(5):
-        assert http.post('/user/reset-password',json={'mobile':mobile,'sms_code':'000000' if codes[0]!='000000' else '111111','new_password':'Attempt-synthetic42!'}).status_code == 400
-    assert http.post('/user/reset-password',json={'mobile':mobile,'sms_code':codes[0],'new_password':'Attempt-synthetic42!'}).status_code == 400
+        assert http.post('/user/reset-password',json={'mobile':mobile,'session_id':session,'sms_code':'000000' if codes[0]!='000000' else '111111','new_password':'Attempt-synthetic42!'}).status_code == 400
+    assert http.post('/user/reset-password',json={'mobile':mobile,'session_id':session,'sms_code':codes[0],'new_password':'Attempt-synthetic42!'}).status_code == 400
     assert http.post('/user/reset-password/sms',json={'mobile':mobile,'device_id':'another-device-00001'}).status_code == 429
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('UPDATE auth_sms_limits SET last_issued_at=DATE_SUB(NOW(),INTERVAL 61 SECOND) WHERE scope_hash=%s',(service.digest('mobile:'+mobile),))
+        conn.commit()
+    replacement=http.post('/user/reset-password/sms',json={'mobile':mobile,'device_id':'another-device-00001'})
+    assert replacement.status_code == 200
+    # A sender that knows the handle can still deny recovery across reissue.
+    assert http.post('/user/reset-password',json={'mobile':mobile,'session_id':replacement.json()['session_id'],'sms_code':codes[-1],'new_password':'Attempt-synthetic42!'}).status_code == 400
+
+
+def test_reset_unknown_or_superseded_handle_does_not_spend_attempts(http, users, db, monkeypatch):
+    from services import auth_security_service as service
+    codes=[]
+    monkeypatch.setattr(service,'send_sms',lambda mobile,code,purpose,request_id: codes.append(code) or 'controlled')
+    mobile=_mobile(db,users[0])
+    first=http.post('/user/reset-password/sms',json={'mobile':mobile,'device_id':'blind-guess-device-0001'})
+    assert first.status_code == 200
+    session=first.json()['session_id']
+    body={'mobile':mobile,'sms_code':codes[0],'new_password':'Blind-synthetic42!'}
+    assert http.post('/user/reset-password',json=body).status_code == 422
+    assert http.post('/user/reset-password',json={**body,'session_id':'bad'}).status_code == 422
+    wrong='0'*32 if session != '0'*32 else '1'*32
+    for _ in range(8):
+        assert http.post('/user/reset-password',json={**body,'session_id':wrong}).status_code == 400
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT attempt_count FROM auth_sms_limits WHERE scope_hash=%s',(service.digest('attempt:'+mobile+':password_reset'),))
+            assert cur.fetchone() is None
+            cur.execute('UPDATE auth_sms_limits SET last_issued_at=DATE_SUB(NOW(),INTERVAL 61 SECOND) WHERE scope_hash=%s',(service.digest('mobile:'+mobile),))
+        conn.commit()
+    second=http.post('/user/reset-password/sms',json={'mobile':mobile,'device_id':'blind-guess-device-0001'})
+    assert second.status_code == 200
+    for _ in range(8):
+        assert http.post('/user/reset-password',json={**body,'session_id':session}).status_code == 400
+    assert http.post('/user/reset-password',json={**body,'session_id':second.json()['session_id'],'sms_code':codes[-1]}).status_code == 200
 
 
 def test_legacy_jwt_and_logout(http, users, token, db):
@@ -85,12 +122,13 @@ def test_reset_rolls_back_code_when_audit_fails(http, users, db, monkeypatch):
     codes=[]
     monkeypatch.setattr(service,'send_sms',lambda mobile,code,purpose,request_id: codes.append(code) or 'controlled')
     mobile=_mobile(db,users[0])
-    assert http.post('/user/reset-password/sms',json={'mobile':mobile,'device_id':'rollback-device-0001'}).status_code == 200
+    issued=http.post('/user/reset-password/sms',json={'mobile':mobile,'device_id':'rollback-device-0001'})
+    assert issued.status_code == 200
     real_audit=routes.audit
     def fail(*args,**kwargs):
         raise RuntimeError('synthetic precommit failure')
     monkeypatch.setattr(routes,'audit',fail)
-    body={'mobile':mobile,'sms_code':codes[0],'new_password':'Rollback-synthetic42!'}
+    body={'mobile':mobile,'session_id':issued.json()['session_id'],'sms_code':codes[0],'new_password':'Rollback-synthetic42!'}
     assert http.post('/user/reset-password',json=body).status_code == 500
     monkeypatch.setattr(routes,'audit',real_audit)
     assert http.post('/user/reset-password',json=body).status_code == 200
@@ -133,14 +171,14 @@ def test_expiry_purpose_subject_and_resend_limits(http, users, db, monkeypatch):
             assert not service.consume_sms(cur,_mobile(db,users[1]),'password_reset',mobile,codes[0],first['session_id'])
             cur.execute('UPDATE auth_sms_challenges SET expires_at=DATE_SUB(NOW(),INTERVAL 1 SECOND) WHERE session_id=%s',(first['session_id'],))
             conn.commit()
-    assert http.post('/user/reset-password',json={'mobile':mobile,'sms_code':codes[0],'new_password':'Expiry-synthetic42!'}).status_code == 400
+    assert http.post('/user/reset-password',json={'mobile':mobile,'session_id':first['session_id'],'sms_code':codes[0],'new_password':'Expiry-synthetic42!'}).status_code == 400
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute('UPDATE auth_sms_limits SET last_issued_at=DATE_SUB(NOW(),INTERVAL 61 SECOND) WHERE scope_hash=%s',(service.digest('mobile:'+mobile),))
-            cur.execute('UPDATE auth_sms_limits SET attempt_count=5 WHERE scope_hash=%s',(service.digest('attempt:'+mobile+':password_reset'),))
+            cur.execute('INSERT INTO auth_sms_limits(scope_hash,window_start,attempt_count) VALUES(%s,NOW(),5) ON DUPLICATE KEY UPDATE attempt_count=5',(service.digest('attempt:'+mobile+':password_reset'),))
         conn.commit()
-    service.issue_sms(mobile,'password_reset',mobile,'expiry-ip','expiry-device')
-    assert http.post('/user/reset-password',json={'mobile':mobile,'sms_code':codes[-1],'new_password':'Expiry-synthetic42!'}).status_code == 400
+    second=service.issue_sms(mobile,'password_reset',mobile,'expiry-ip','expiry-device')
+    assert http.post('/user/reset-password',json={'mobile':mobile,'session_id':second['session_id'],'sms_code':codes[-1],'new_password':'Expiry-synthetic42!'}).status_code == 400
 
 def test_operator_changes_have_atomic_trusted_audit(http, users, token, db, monkeypatch):
     from core.config import settings
@@ -206,7 +244,8 @@ def test_reset_waits_for_mobile_move_then_rejects_old_identity(http, users, db, 
     codes=[]
     monkeypatch.setattr(service,'send_sms',lambda mobile,code,purpose,request_id: codes.append(code) or 'controlled')
     mobile=_mobile(db,users[0])
-    assert http.post('/user/reset-password/sms',json={'mobile':mobile,'device_id':'mobile-race-device-0001'}).status_code == 200
+    issued=http.post('/user/reset-password/sms',json={'mobile':mobile,'device_id':'mobile-race-device-0001'})
+    assert issued.status_code == 200
     reached=Event()
     original=routes.build_dynamic_select
     def select(*args,**kwargs):
@@ -219,7 +258,7 @@ def test_reset_waits_for_mobile_move_then_rejects_old_identity(http, users, db, 
             cur.execute('SELECT id FROM users WHERE id=%s FOR UPDATE',(users[0],))
             cur.execute('UPDATE users SET mobile=%s WHERE id=%s',('177'+mobile[3:],users[0]))
         with ThreadPoolExecutor(max_workers=1) as pool:
-            future=pool.submit(http.post,'/user/reset-password',json={'mobile':mobile,'sms_code':codes[0],'new_password':'Move-race-synthetic42!'})
+            future=pool.submit(http.post,'/user/reset-password',json={'mobile':mobile,'session_id':issued.json()['session_id'],'sms_code':codes[0],'new_password':'Move-race-synthetic42!'})
             assert reached.wait(15)
             mover.commit()
             assert future.result(timeout=30).status_code == 400
@@ -229,13 +268,14 @@ def test_reset_code_cannot_follow_reassigned_mobile(http, users, db, monkeypatch
     codes=[]
     monkeypatch.setattr(service,'send_sms',lambda mobile,code,purpose,request_id: codes.append(code) or 'controlled')
     mobile=_mobile(db,users[0])
-    assert http.post('/user/reset-password/sms',json={'mobile':mobile,'device_id':'reassign-device-00001'}).status_code == 200
+    issued=http.post('/user/reset-password/sms',json={'mobile':mobile,'device_id':'reassign-device-00001'})
+    assert issued.status_code == 200
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute('UPDATE users SET mobile=%s WHERE id=%s',('166'+mobile[3:],users[0]))
             cur.execute('UPDATE users SET mobile=%s WHERE id=%s',(mobile,users[1]))
         conn.commit()
-    assert http.post('/user/reset-password',json={'mobile':mobile,'sms_code':codes[0],'new_password':'Reassign-synthetic42!'}).status_code == 400
+    assert http.post('/user/reset-password',json={'mobile':mobile,'session_id':issued.json()['session_id'],'sms_code':codes[0],'new_password':'Reassign-synthetic42!'}).status_code == 400
 
 def test_system_role_grant_requires_admin_and_audit(http, users, token, db, monkeypatch):
     from core.config import settings
@@ -292,8 +332,9 @@ def test_reset_allows_fresh_login_and_independent_app_rejects_old(http, users, t
     monkeypatch.setattr(service,'send_sms',lambda mobile,code,purpose,request_id: codes.append(code) or 'controlled')
     mobile=_mobile(db,users[0])
     old=token(users[0],'jwt')
-    assert http.post('/user/reset-password/sms',json={'mobile':mobile,'device_id':'fresh-login-device-0001'}).status_code == 200
-    assert http.post('/user/reset-password',json={'mobile':mobile,'sms_code':codes[0],'new_password':'Fresh-reset-synthetic42!'}).status_code == 200
+    issued=http.post('/user/reset-password/sms',json={'mobile':mobile,'device_id':'fresh-login-device-0001'})
+    assert issued.status_code == 200
+    assert http.post('/user/reset-password',json={'mobile':mobile,'session_id':issued.json()['session_id'],'sms_code':codes[0],'new_password':'Fresh-reset-synthetic42!'}).status_code == 200
     login=http.post('/user/auth',json={'mobile':mobile,'password':'Fresh-reset-synthetic42!'})
     assert login.status_code == 200
     app=FastAPI()
@@ -321,23 +362,26 @@ def test_failed_reissue_is_unusable_and_supersedes_old_code(http, users, db, mon
     from fastapi import HTTPException
     import requests
     codes=[]
+    failed_sessions=[]
     monkeypatch.setattr(service,'send_sms',lambda mobile,code,purpose,request_id: codes.append(code) or 'controlled')
     mobile=_mobile(db,users[0])
     body={'mobile':mobile,'device_id':'provider-failure-device-'+failure}
-    assert http.post('/user/reset-password/sms',json=body).status_code == 200
+    issued=http.post('/user/reset-password/sms',json=body)
+    assert issued.status_code == 200
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute('UPDATE auth_sms_limits SET last_issued_at=DATE_SUB(NOW(),INTERVAL 61 SECOND) WHERE scope_hash=%s',(service.digest('mobile:'+mobile),))
         conn.commit()
     def fail(mobile,code,purpose,request_id):
         codes.append(code)
+        failed_sessions.append(request_id)
         if failure == 'reject':
             raise HTTPException(503,'synthetic supplier rejection')
         raise requests.Timeout('synthetic boundary timeout')
     monkeypatch.setattr(service,'send_sms',fail)
     assert http.post('/user/reset-password/sms',json=body).status_code == 503
-    for code in codes:
-        assert http.post('/user/reset-password',json={'mobile':mobile,'sms_code':code,'new_password':'Provider-synthetic42!'}).status_code == 400
+    for session,code in ((issued.json()['session_id'],codes[0]),(failed_sessions[0],codes[1])):
+        assert http.post('/user/reset-password',json={'mobile':mobile,'session_id':session,'sms_code':code,'new_password':'Provider-synthetic42!'}).status_code == 400
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute('SELECT send_status,consumed_at FROM auth_sms_challenges WHERE mobile=%s ORDER BY id DESC LIMIT 1',(mobile,))

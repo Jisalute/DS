@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, ConfigDict, AliasChoices, model_validator
 from typing import Optional, List, Dict, Any, cast
 from core.config import Settings, settings
 from core.database import get_conn
+from api.order.cart import resolve_sku, validate_quantity, SafeBigintId
 from services.finance_service import split_order_funds
 from core.config import VALID_PAY_WAYS, POINTS_DISCOUNT_RATE
 from core.table_access import build_dynamic_select, get_table_structure, _quote_identifier
@@ -18,6 +19,7 @@ import uuid
 from datetime import datetime, timedelta
 from enum import Enum
 import json
+import hashlib
 import threading
 import time
 from core.logging import get_logger
@@ -45,47 +47,50 @@ EXPIRE_LOCK_MYSQL_NAME = "ds_order_expire_cancel"
 
 
 def _cancel_expire_orders_once() -> int:
-    """取消一批过期 pending_pay 订单，返回处理数量。"""
-    cancelled = 0
+    """失败订单保持原状并记录，健康订单独立提交。"""
+    now = datetime.now()
     with get_conn() as conn:
         with conn.cursor() as cur:
-            now = datetime.now()
             cur.execute(
-                """
-                SELECT id, order_number
-                FROM orders
-                WHERE status='pending_pay'
-                  AND expire_at IS NOT NULL
-                  AND expire_at <= %s
-                FOR UPDATE
-                """,
+                "SELECT id, order_number FROM orders WHERE status='pending_pay' "
+                "AND expire_at IS NOT NULL AND expire_at <= %s ORDER BY id",
                 (now,),
             )
-            for o in cur.fetchall():
-                oid, ono = o["id"], o["order_number"]
-                cur.execute(
-                    "SELECT id FROM pending_rewards WHERE order_id = %s AND status = 'pending'",
-                    (oid,),
-                )
-                for reward in cur.fetchall():
-                    cur.execute("DELETE FROM pending_rewards WHERE id = %s", (reward["id"],))
-                    logger.info("删除订单 %s 待发放奖励 id=%s", ono, reward["id"])
-                cur.execute(
-                    "SELECT sku_id,quantity FROM order_items WHERE order_id=%s",
-                    (oid,),
-                )
-                for it in cur.fetchall():
+            candidates = cur.fetchall()
+    cancelled = 0
+    for candidate in candidates:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE product_skus SET stock=stock+%s WHERE id=%s",
-                        (it["quantity"], it["sku_id"]),
+                        "SELECT id, order_number FROM orders WHERE id=%s AND status='pending_pay' "
+                        "AND expire_at IS NOT NULL AND expire_at <= %s FOR UPDATE",
+                        (candidate["id"], now),
                     )
-                cur.execute(
-                    "UPDATE orders SET status='cancelled',updated_at=NOW() WHERE id=%s",
-                    (oid,),
-                )
-                cancelled += 1
-                logger.info("订单 %s 已自动取消（支付超时）", ono)
-            conn.commit()
+                    current = cur.fetchone()
+                    if not current:
+                        continue
+                    oid, ono = current["id"], current["order_number"]
+                    cur.execute(
+                        "SELECT product_id, sku_id, quantity FROM order_items WHERE order_id=%s ORDER BY sku_id",
+                        (oid,),
+                    )
+                    for item in cur.fetchall():
+                        validate_quantity(item["quantity"])
+                        sku_id = resolve_sku(cur, item["product_id"], item["sku_id"])
+                        cur.execute(
+                            "UPDATE product_skus SET stock=stock+%s WHERE id=%s AND product_id=%s",
+                            (item["quantity"], sku_id, item["product_id"]),
+                        )
+                        if cur.rowcount != 1:
+                            raise HTTPException(status_code=422, detail="历史 SKU 无法安全归还库存")
+                    cur.execute("DELETE FROM pending_rewards WHERE order_id=%s AND status='pending'", (oid,))
+                    cur.execute("UPDATE orders SET status='cancelled',updated_at=NOW() WHERE id=%s", (oid,))
+                    conn.commit()
+                    cancelled += 1
+                    logger.info("订单 %s 已自动取消（支付超时）", ono)
+        except Exception:
+            logger.exception("过期订单取消失败，保持原状待核查: order_id=%s", candidate["id"])
     return cancelled
 
 
@@ -162,15 +167,41 @@ class OrderManager:
             custom_addr: Optional[dict],
             specifications: Optional[str] = None,
             buy_now: bool = False,
-            buy_now_items: Optional[List[Dict[str, Any]]] = None,
+            buy_now_items: Optional[List[Any]] = None,
             delivery_way: str = "platform",
             points_to_use: Optional[Decimal] = None,
             coupon_id: Optional[int] = None,
             coupon_ids: Optional[List[int]] = None,
             idempotency_key: Optional[str] = None,
-            merchant_id: Optional[int] = None
-    ) -> Optional[str]:
-        """创建订单（已增加幂等性校验，防止重复创建，支持多商家订单）"""
+            merchant_id: Optional[int] = None,
+            cart_snapshot: Optional[List[Dict[str, Any]]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """创建订单；有幂等键时与订单在同一事务保存请求和结果。"""
+        request_hash = None
+        key_hash = None
+        snapshot = None
+        if not buy_now:
+            if not cart_snapshot:
+                raise HTTPException(422, "购物车下单必须提供确认快照")
+            snapshot = sorted(
+                (int(item.product_id), int(item.sku_id), item.quantity)
+                for item in (CartSnapshotItem.model_validate(raw) for raw in cart_snapshot)
+            )
+            if len({(product, sku) for product, sku, _ in snapshot}) != len(snapshot):
+                raise HTTPException(422, "购物车快照包含重复商品 SKU")
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key) <= 128:
+                raise HTTPException(422, "幂等键长度须为1至128字符")
+            key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+            payload = {
+                "address_id": address_id, "custom_address": custom_addr,
+                "specifications": specifications, "buy_now": buy_now,
+                "buy_now_items": [BuyNowItem.model_validate(item).model_dump(mode="json") for item in buy_now_items] if buy_now_items else None,
+                "delivery_way": delivery_way, "points_to_use": str(points_to_use) if points_to_use is not None else None,
+                "coupon_id": coupon_id, "coupon_ids": coupon_ids, "merchant_id": merchant_id,
+                "cart_snapshot": snapshot,
+            }
+            request_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
         lock_key = f"order:create:{user_id}"
         create_lock = RedisRenewableLock(
             lock_key,
@@ -178,7 +209,7 @@ class OrderManager:
             renew_interval_seconds=settings.ORDER_CREATE_LOCK_RENEW,
         )
         lock_acquired = False
-        if redis_client:
+        if redis_client and idempotency_key is None:
             try:
                 lock_acquired = create_lock.acquire()
                 if not lock_acquired:
@@ -194,8 +225,93 @@ class OrderManager:
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
+                    # Lock the FK parent before SKU locks for both purchase modes.
+                    cur.execute("SELECT 1 FROM users WHERE id=%s FOR UPDATE", (user_id,))
+                    if not cur.fetchone():
+                        raise HTTPException(status_code=404, detail="用户不存在")
 
-                    if not buy_now:
+                    if key_hash is not None:
+                        cur.execute(
+                            "SELECT request_hash, order_number, need_pay FROM order_creation_idempotency "
+                            "WHERE user_id=%s AND key_hash=%s", (user_id, key_hash),
+                        )
+                        prior = cur.fetchone()
+                        if prior:
+                            if prior["request_hash"] != request_hash:
+                                raise HTTPException(409, "幂等键已用于不同的订单请求")
+                            return {"order_number": prior["order_number"], "need_pay": bool(prior["need_pay"])}
+
+
+
+                    # ---------- 1. 组装订单明细 ----------
+                    if buy_now:
+                        if not buy_now_items:
+                            raise HTTPException(status_code=422, detail="立即购买时 buy_now_items 不能为空")
+                        items = []
+                        product_merchant_ids = set()
+
+                        for raw_item in buy_now_items:
+                            it = BuyNowItem.model_validate(raw_item).model_dump()
+                            cur.execute("SELECT is_member_product, user_id, cash_only FROM products WHERE id = %s",
+                                        (it["product_id"],))
+                            prod = cur.fetchone()
+                            if not prod:
+                                raise HTTPException(status_code=404,
+                                                    detail=f"products 表中不存在 id={it['product_id']}")
+
+                            product_merchant_ids.add(prod.get("user_id") or 0)
+
+                            sku_id = resolve_sku(cur, it["product_id"], it.get("sku_id"))
+
+                            items.append({
+                                "sku_id": sku_id,
+                                "product_id": it["product_id"],
+                                "quantity": it["quantity"],
+                                "price": None,
+                                "is_vip": prod["is_member_product"],
+                                "cash_only": prod["cash_only"]  # 新增
+                            })
+
+                        if len(product_merchant_ids) > 1:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="一笔订单只能包含同一商家的商品，请分开下单"
+                            )
+
+                        actual_merchant = next(iter(product_merchant_ids), 0)
+                        if merchant_id is not None and int(merchant_id) != int(actual_merchant):
+                            raise HTTPException(422, "商户与商品归属不匹配")
+                        merchant_id = actual_merchant
+                    else:
+                        cur.execute("""
+                            SELECT c.id AS cart_id, c.product_id,
+                                c.sku_id,
+                                c.quantity,
+                                NULL AS price,
+                                p.is_member_product AS is_vip,
+                                p.user_id as merchant_id,
+                                c.specifications,
+                                p.cash_only
+                            FROM cart c
+                            LEFT JOIN products p ON p.id = c.product_id
+                            WHERE c.user_id = %s
+                            ORDER BY c.id FOR UPDATE
+                        """, (user_id,))
+                        items = cur.fetchall()
+                        by_key = {}
+                        for item in items:
+                            if item["sku_id"] is None:
+                                continue
+                            key = (int(item["product_id"]), int(item["sku_id"]))
+                            if key in by_key:
+                                raise HTTPException(409, {"code": "CART_SNAPSHOT_CHANGED", "message": "购物车已变化，请重新确认"})
+                            by_key[key] = item
+                        items = []
+                        for product_id, sku_id, quantity in snapshot:
+                            item = by_key.get((product_id, sku_id))
+                            if item is None or item["quantity"] != quantity:
+                                raise HTTPException(409, {"code": "CART_SNAPSHOT_CHANGED", "message": "购物车已变化，请重新确认"})
+                            items.append(item)
                         cur.execute("""
                             SELECT order_number, status, created_at 
                             FROM orders 
@@ -213,91 +329,6 @@ class OrderManager:
                                 status_code=400,
                                 detail=f"您刚刚已创建订单 {recent_order['order_number']}，请勿重复提交"
                             )
-
-                    if idempotency_key and redis_client:
-                        used_key = f"order:idempotency:{idempotency_key}"
-                        if redis_client.exists(used_key):
-                            existing_order = redis_client.get(used_key)
-                            logger.info(f"幂等 Key 重复，返回已存在订单: {existing_order}")
-                            return existing_order
-
-                    # ---------- 1. 组装订单明细 ----------
-                    if buy_now:
-                        if not buy_now_items:
-                            raise HTTPException(status_code=422, detail="立即购买时 buy_now_items 不能为空")
-                        items = []
-                        product_merchant_ids = set()
-
-                        for it in buy_now_items:
-                            it = it.model_dump()
-                            cur.execute("SELECT is_member_product, user_id, cash_only FROM products WHERE id = %s",
-                                        (it["product_id"],))
-                            prod = cur.fetchone()
-                            if not prod:
-                                raise HTTPException(status_code=404,
-                                                    detail=f"products 表中不存在 id={it['product_id']}")
-
-                            product_merchant_ids.add(prod.get("user_id") or 0)
-
-                            sku_id = it.get("sku_id")
-                            if not sku_id:
-                                cur.execute("SELECT id FROM product_skus WHERE product_id = %s LIMIT 1",
-                                            (it['product_id'],))
-                                sku_row = cur.fetchone()
-                                if sku_row:
-                                    sku_id = sku_row.get('id')
-                                else:
-                                    raise HTTPException(status_code=422,
-                                                        detail=f"商品 {it['product_id']} 无可用 SKU，请提供 sku_id")
-
-                            quantity = it.get("quantity")
-                            if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
-                                raise HTTPException(status_code=422, detail="商品数量必须为正整数")
-                            cur.execute(
-                                "SELECT id, product_id, price FROM product_skus WHERE id=%s AND product_id=%s",
-                                (sku_id, it["product_id"]),
-                            )
-                            sku = cur.fetchone()
-                            if not sku:
-                                raise HTTPException(status_code=422, detail="SKU不属于该商品或已下架")
-
-                            items.append({
-                                "sku_id": sku_id,
-                                "product_id": it["product_id"],
-                                "quantity": quantity,
-                                "price": Decimal(str(sku["price"])),
-                                "is_vip": prod["is_member_product"],
-                                "cash_only": prod["cash_only"]  # 新增
-                            })
-
-                        if len(product_merchant_ids) > 1:
-                            raise HTTPException(
-                                status_code=400,
-                                detail="一笔订单只能包含同一商家的商品，请分开下单"
-                            )
-
-                        actual_merchant = next(iter(product_merchant_ids), 0)
-                        if merchant_id is not None and int(merchant_id) != int(actual_merchant):
-                            raise HTTPException(422, "商户与商品归属不匹配")
-                        merchant_id = actual_merchant
-                    else:
-                        cur.execute("""
-                            SELECT c.product_id,
-                                c.sku_id,
-                                c.quantity,
-                                s.price,
-                                p.is_member_product AS is_vip,
-                                p.user_id as merchant_id,
-                                c.specifications,
-                                p.cash_only
-                            FROM cart c
-                            JOIN product_skus s ON s.id = c.sku_id AND s.product_id = c.product_id
-                            JOIN products p ON p.id = c.product_id
-                            WHERE c.user_id = %s AND c.selected = 1
-                        """, (user_id,))
-                        items = cur.fetchall()
-                        if not items:
-                            return None
                         for item in items:
                             quantity = item.get("quantity")
                             if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
@@ -316,6 +347,30 @@ class OrderManager:
                         merchant_id = actual_merchant
 
                     merchant_id = int(merchant_id or 0)
+
+                    # Lock SKUs in one order across buyers, then price and reserve from the same rows.
+                    for item in items:
+                        validate_quantity(item["quantity"])
+                        item["sku_id"] = resolve_sku(cur, item["product_id"], item.get("sku_id"))
+                    for item in sorted(items, key=lambda item: item["sku_id"]):
+                        cur.execute(
+                            "SELECT price, stock FROM product_skus WHERE id=%s AND product_id=%s FOR UPDATE",
+                            (item["sku_id"], item["product_id"]),
+                        )
+                        sku = cur.fetchone()
+                        if not sku:
+                            raise HTTPException(status_code=422, detail="SKU 不存在或不属于该商品")
+                        price = Decimal(str(sku["price"]))
+                        if not price.is_finite() or price < 0:
+                            raise HTTPException(status_code=422, detail="SKU 价格配置无效")
+                        item["price"] = price
+                        cur.execute(
+                            "UPDATE product_skus SET stock = stock - %s "
+                            "WHERE id=%s AND product_id=%s AND stock >= %s",
+                            (item["quantity"], item["sku_id"], item["product_id"], item["quantity"]),
+                        )
+                        if cur.rowcount != 1:
+                            raise HTTPException(status_code=400, detail=f"SKU {item['sku_id']} 库存不足")
 
                     # ---------- 2. 优惠券商品类型验证（支持多张券叠加） ----------
                     has_vip = any(i["is_vip"] for i in items)
@@ -418,13 +473,7 @@ class OrderManager:
                         raise HTTPException(status_code=422, detail="必须上传收货地址或选择自提")
 
                     # ---------- 4. 订单主表 ----------
-                    user_id_str = str(user_id)
-                    uuid_len = 32 - 14 - len(user_id_str)
-                    order_number = (
-                            datetime.now().strftime("%Y%m%d%H%M%S") +
-                            user_id_str +
-                            uuid.uuid4().hex[:uuid_len]
-                    )
+                    order_number = datetime.now().strftime("%Y%m%d%H%M%S") + uuid.uuid4().hex[:18]
 
                     cur.execute("""
                         INSERT INTO orders(
@@ -452,22 +501,6 @@ class OrderManager:
                     ))
                     oid = cur.lastrowid
 
-                    # ---------- 5. 库存校验 & 扣减 ----------
-                    structure = get_table_structure(cur, "product_skus")
-                    has_stock_field = 'stock' in structure['fields']
-                    stock_select = (
-                        f"COALESCE({_quote_identifier('stock')}, 0) AS {_quote_identifier('stock')}"
-                        if has_stock_field and 'stock' in structure['asset_fields']
-                        else _quote_identifier('stock')
-                    ) if has_stock_field else "0 AS stock"
-
-                    for i in items:
-                        cur.execute(f"SELECT {stock_select} FROM {_quote_identifier('product_skus')} WHERE id=%s",
-                                    (i['sku_id'],))
-                        result = cur.fetchone()
-                        current_stock = result.get('stock', 0) if result else 0
-                        if current_stock < i["quantity"]:
-                            raise HTTPException(status_code=400, detail=f"SKU {i['sku_id']} 库存不足")
 
                     # ---------- 6. 写订单明细 ----------
                     for i in items:
@@ -479,20 +512,13 @@ class OrderManager:
                             i["price"], Decimal(str(i["quantity"])) * Decimal(str(i["price"]))
                         ))
 
-                    # ---------- 7. 扣库存 ----------
-                    if has_stock_field:
-                        for i in items:
-                            cur.execute(
-                                "UPDATE product_skus SET stock = stock - %s "
-                                "WHERE id = %s AND stock >= %s",
-                                (i["quantity"], i["sku_id"], i["quantity"]),
-                            )
-                            if cur.rowcount != 1:
-                                raise HTTPException(status_code=409, detail="库存不足或库存已被其他订单占用")
 
-                    # ---------- 8. 清空购物车（仅购物车结算场景） ----------
+                    # 仅删除用户确认购买并锁定的购物车行，保留其他商品。
                     if not buy_now:
-                        cur.execute("DELETE FROM cart WHERE user_id = %s AND selected = 1", (user_id,))
+                        cart_ids = [item["cart_id"] for item in items]
+                        placeholders = ",".join(["%s"] * len(cart_ids))
+                        cur.execute(f"DELETE FROM cart WHERE user_id = %s AND id IN ({placeholders})",
+                                    (user_id, *cart_ids))
 
                     # 结算逻辑：零元或普通订单均在 finance_service 内处理状态和优惠券
                     if is_zero_order:
@@ -507,9 +533,12 @@ class OrderManager:
                             external_conn=conn
                         )
 
-                    if idempotency_key and redis_client:
-                        used_key = f"order:idempotency:{idempotency_key}"
-                        redis_client.setex(used_key, 86400, order_number)
+                    if key_hash is not None:
+                        cur.execute(
+                            "INSERT INTO order_creation_idempotency "
+                            "(user_id, key_hash, request_hash, order_number, need_pay) VALUES (%s,%s,%s,%s,%s)",
+                            (user_id, key_hash, request_hash, order_number, not is_zero_order),
+                        )
 
                     conn.commit()
                     logger.info(f"订单创建成功: {order_number}, 用户: {user_id}, 商家: {merchant_id}")
@@ -753,11 +782,17 @@ class OrderManager:
                     raise HTTPException(404, '订单不存在')
                 if current_user is not None and not is_platform_admin(current_user) and int(order.get('merchant_id') or 0) != int(current_user['id']):
                     raise HTTPException(403, '无权更新该订单')
-                allowed = {'pending_ship': {'pending_recv'}, 'pending_recv': {'completed'}}
+                allowed = {'pending_ship': {'pending_recv'}}
                 if trusted_payment and external_conn is not None and order['status'] in ('pending_pay', new_status):
                     allowed[order['status']] = {'pending_ship', 'pending_recv', 'completed'}
                     if order['status'] == new_status:
                         return True
+                elif (trusted_payment and external_conn is not None
+                      and order['status'] in ('pending_ship', 'pending_recv')
+                      and new_status == 'completed'
+                      and Decimal(str(order['total_amount'])) == 0):
+                    # Zero-cash virtual orders start in a fulfillment state before settlement.
+                    allowed[order['status']] = {'completed'}
                 if new_status not in allowed.get(order['status'], set()):
                     raise HTTPException(409, '非法订单状态流转')
                 cur.execute('UPDATE orders SET status=%s,updated_at=NOW() WHERE id=%s AND status=%s', (new_status, order['id'], order['status']))
@@ -1025,11 +1060,23 @@ class DeliveryWay(str, Enum):
 
 
 class BuyNowItem(BaseModel):
-    product_id: StrictInt = Field(..., gt=0)
-    sku_id: Optional[StrictInt] = Field(default=None, gt=0)
-    quantity: StrictInt = Field(..., gt=0)
-    # Retained for old clients; the server never trusts this amount.
-    price: Optional[Decimal] = Field(default=None, ge=0)
+    product_id: SafeBigintId
+    sku_id: Optional[SafeBigintId] = None
+    quantity: int = Field(strict=True, ge=1, le=2147483647)
+    price: Optional[Decimal] = Field(default=None, ge=0, description="兼容旧客户端；忽略此值，使用服务端 SKU 价格")
+
+
+class CartSnapshotItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_id: str = Field(strict=True, pattern=r"^[1-9][0-9]*$", max_length=20)
+    sku_id: str = Field(strict=True, pattern=r"^[1-9][0-9]*$", max_length=20)
+    quantity: int = Field(strict=True, ge=1, le=2147483647)
+
+    @model_validator(mode="after")
+    def validate_ids(self):
+        if int(self.product_id) > 18446744073709551615 or int(self.sku_id) > 18446744073709551615:
+            raise ValueError("商品或 SKU ID 超出 BIGINT UNSIGNED 范围")
+        return self
 
 
 class OrderCreate(BaseModel):
@@ -1128,7 +1175,7 @@ class OrderCreate(BaseModel):
 
         return d
 
-    user_id: int = Field(validation_alias=AliasChoices("user_id", "userId"))
+    user_id: SafeBigintId = Field(validation_alias=AliasChoices("user_id", "userId"))
     delivery_way: DeliveryWay = Field(
         default=DeliveryWay.platform,
         validation_alias=AliasChoices("delivery_way", "deliveryWay"),
@@ -1147,6 +1194,19 @@ class OrderCreate(BaseModel):
         default=None,
         validation_alias=AliasChoices("buy_now_items", "buyNowItems"),
     )
+    cart_snapshot: Optional[List[CartSnapshotItem]] = Field(
+        default=None, min_length=1, validation_alias=AliasChoices("cart_snapshot", "cartSnapshot")
+    )
+
+    @model_validator(mode="after")
+    def validate_cart_snapshot(self):
+        if not self.buy_now and not self.cart_snapshot:
+            raise ValueError("购物车下单必须提供确认快照")
+        if self.cart_snapshot:
+            keys = {(item.product_id, item.sku_id) for item in self.cart_snapshot}
+            if len(keys) != len(self.cart_snapshot):
+                raise ValueError("购物车快照包含重复商品 SKU")
+        return self
     points_to_use: Optional[Decimal] = Field(
         default=Decimal('0'), ge=0,
         validation_alias=AliasChoices("points_to_use", "pointsToUse"),
@@ -1161,6 +1221,7 @@ class OrderCreate(BaseModel):
     )
     idempotency_key: Optional[str] = Field(
         default=None,
+        min_length=1, max_length=128,
         validation_alias=AliasChoices("idempotency_key", "idempotencyKey"),
     )
     merchant_id: Optional[int] = Field(
@@ -1229,7 +1290,8 @@ def create_order(body: OrderCreate, current_user: dict = Depends(get_current_use
         coupon_id=body.coupon_id,
         coupon_ids=body.coupon_ids,
         idempotency_key=body.idempotency_key,
-        merchant_id=body.merchant_id
+        merchant_id=body.merchant_id,
+        cart_snapshot=[item.model_dump() for item in body.cart_snapshot] if body.cart_snapshot else None,
     )
     if not result or not result.get("order_number"):
         raise HTTPException(status_code=422, detail="购物车为空或地址缺失")

@@ -146,7 +146,9 @@ def issue_sms(mobile, purpose, subject, ip, device, user_id=None):
 
 def consume_sms(cur, mobile, purpose, subject, code, session_id=None, expected_user_id=None):
     # Caller commits rejected attempts; successful consumption shares the business transaction.
-    if not _limit(cur, "attempt:"+mobile+":"+purpose, 5):
+    # Preserve bankcard's existing accounting; reset counts only a matching
+    # challenge handle, while retaining the mobile/purpose limit across reissues.
+    if purpose != "password_reset" and not _limit(cur, "attempt:"+mobile+":"+purpose, 5):
         return False
     cur.execute("""SELECT *,expires_at>NOW() AS alive FROM auth_sms_challenges
         WHERE mobile=%s AND purpose=%s AND subject_hash=%s ORDER BY id DESC LIMIT 1 FOR UPDATE""",
@@ -156,7 +158,9 @@ def consume_sms(cur, mobile, purpose, subject, code, session_id=None, expected_u
         return False
     if purpose == "password_reset" and (expected_user_id is None or row["user_id"] != expected_user_id):
         return False
-    if session_id is not None and session_id != row["session_id"]:
+    if session_id is None or session_id != row["session_id"]:
+        return False
+    if purpose == "password_reset" and not _limit(cur, "attempt:"+mobile+":"+purpose, 5):
         return False
     if not hmac.compare_digest(row["code_hash"], digest(row["session_id"]+":"+code)):
         return False

@@ -8,7 +8,7 @@ from models.schemas.user import (
     SetStatusReq, AuthReq, AuthResp, UpdateProfileReq, SelfDeleteReq,
     FreezeReq, ResetPwdReq, AdminResetPwdReq, SetLevelReq, AddressReq,
     UpdateAddressReq,
-    PointsReq, UserInfoResp, BindReferrerReq,MobileResp,Query,AvatarUploadResp,
+    PointsReq, UserInfoResp, UserIdentityResp, BindReferrerReq,MobileResp,Query,AvatarUploadResp,
     AvatarReviewStatusResp,
     UnilevelStatusResponse, UnilevelPromoteResponse,UserAllPointsResponse,UserPointsSummaryResponse,SetUnilevelReq,
     ReferralQRResponse,DecryptPhoneReq, DecryptPhoneResp,GetPhoneReq, GetPhoneResp
@@ -240,8 +240,8 @@ def _set_status(mobile, status, reason, operator):
             conn.commit()
     return {"msg": "ok", "success": True}
 
-def _consume_password_reset_code(cur, mobile: str, sms_code: str, user_id: int | None = None) -> bool:
-    return consume_sms(cur, mobile, "password_reset", mobile, sms_code, expected_user_id=user_id)
+def _consume_password_reset_code(cur, mobile: str, sms_code: str, session_id: str, user_id: int | None = None) -> bool:
+    return consume_sms(cur, mobile, "password_reset", mobile, sms_code, session_id, expected_user_id=user_id)
 
 
 @router.post("/user/reset-password/sms", summary="发送找回密码验证码")
@@ -262,7 +262,7 @@ def reset_password(body: ResetPwdReq):
             )
             cur.execute(select_sql + " FOR UPDATE", (body.mobile,))
             u = cur.fetchone()
-            if not _consume_password_reset_code(cur, body.mobile, body.sms_code, u["id"] if u else None):
+            if not _consume_password_reset_code(cur, body.mobile, body.sms_code, body.session_id, u["id"] if u else None):
                 conn.commit()
                 raise HTTPException(status_code=400, detail="验证码错误或已过期")
 
@@ -322,6 +322,12 @@ def _set_member_level(mobile, level, reason, operator):
             audit(cur, operator["id"], row["id"], "set_member_level", {"level":old}, {"level":new}, reason)
             conn.commit()
     return {"old_level":old,"new_level":new}
+
+@router.get("/user/me/identity", summary="查询当前认证账户身份", response_model=UserIdentityResp)
+def get_my_identity(current_user: dict = Depends(get_current_user)):
+    """只返回当前会话认证的用户 ID；管理员也不能选择其他账户。"""
+    return UserIdentityResp(user_id=str(int(current_user["id"])))
+
 
 @router.get("/user/info", summary="用户详情（个人中心）", response_model=UserInfoResp)
 def user_info(mobile: str, current_user: dict = Depends(get_current_user)):

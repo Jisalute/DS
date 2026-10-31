@@ -4,6 +4,8 @@
 
 2026-10-25: AUTH-001/002, USER-001 and user/bankcard PRIVACY-001 cutover. Apply numbered migration `004_security_auth.sql` with the tracked migration runner before serving requests. It creates InnoDB SMS limit/challenge and operator-audit tables, ensures point audit columns, and explicitly deletes existing sessions once. Stateless JWTs lacking `sid` are always rejected; `users.token` is never an authentication source. Existing clients must discard stored tokens and log in again. No shared key grants permissions. Optional legacy `key`/`admin_key` fields are ignored, not credentials. No refresh-token flow exists.
 
+2026-11-01 candidate: password reset now requires the issuance response's `session_id`. This is a breaking change: old clients receive 422 and cannot reset. Ship the client and server together; retain the latest send response in the client and submit its `session_id` with the same mobile and SMS code. No legacy bypass. Existing challenges and counters remain in migration 004's tables; no new SQL migration or counter reset is required. During a rolling deployment old instances still accept requests without the handle, so keep reset unavailable until all instances have cut over. Do not roll back to old code as a security fix.
+
 All protected requests use `Authorization: Bearer <token>`. JSON endpoints accept/return application/json; SMS bankcard sending uses application/x-www-form-urlencoded. Responses are HTTP200 unless stated. Error shape is `{"detail":"reason"}`; 401 invalid/expired/revoked/missing credential means log in again, 403 ownership/role/status means do not retry as another ID, 400 business rejection means correct the input, 422 schema rejection means correct format, 429 wait for limit window, 503 means service unavailable (never treat it as sent). Server failures never imply success. HTTP500 may occur on transaction failure; no successful local transaction is inferred.
 
 ## Identity and revocation contract
@@ -11,6 +13,63 @@ All protected requests use `Authorization: Bearer <token>`. JSON endpoints accep
 `POST /user/auth`: unchanged body `mobile` string, `password` string, optional `name` (custom name forbidden for new registration). Returns `uid` integer internal account ID, `token` string Bearer JWT, `level` integer membership star, `is_new` boolean. Example request `POST /user/auth`, header Content-Type application/json, body `{"mobile":"19900000001","password":"Synthetic-pass-42!"}`; success `{"uid":42,"token":"<credential>","level":0,"is_new":false}`. Wrong password yields400; frozen/deleted403. JWT issuance locks the user and compares the hash used for password verification so a concurrent password change cannot mint a valid stale credential. UUID is issued/accepted only with ENABLE_UUID_AUTH; its disabled issuance defaults to JWT. `POST /wechat/login` retains WeChat-code verification and its existing response; its 124-character opaque token uses the same sessions table. The unused hardcoded-key WechatService.generate_token issuer was removed.
 
 Every supported token authenticates through unexpired sessions joined to active users. JWT includes signed user_id, sid, exp, iat, type=access and session ownership is checked. No identity cache or legacy fallback. Authentication storage outage503 fails closed. Password reset/change, admin password reset, freeze/delete/unfreeze and admin mobile change delete all target-user sessions in their mutation transaction; unrelated users remain logged in. `invalidate_token(token)` deletes the JWT sid or exact opaque token and propagates DB errors. There is no new logout HTTP route.
+
+## 当前认证账户身份
+
+### 基本信息
+
+`GET /user/me/identity` 返回服务器通过当前有效会话认证的账户 ID，供客户端区分账户，例如隔离订单幂等操作。需登录；普通用户、商户及平台管理员均可调用，但管理员也只能得到自己的 ID。无特定角色或会员资格要求。请求无请求体，故不要求请求 `Content-Type`；响应为 `application/json`，成功 HTTP 200。路径以部署服务根 URL 为准，例如 `https://<api-host>/user/me/identity`。
+
+### 请求参数
+
+| 参数 | 位置 | 类型/JSON 类型 | 必填 | 默认值 | 格式、校验及含义 | 合法 / 非法示例 |
+|---|---|---|---|---|---|---|
+| Authorization | header | string / 不适用 | 是 | 无 | `Bearer <token>`；token 必须是当前有效、未撤销的服务端会话凭证 | `Bearer <valid-token>` / 缺失或 `Bearer invalid` |
+
+无 path、query、cookie 或 body 参数，无请求体。未声明的 query 参数被框架忽略，不是身份选择器；例如 `?user_id=123&mobile=19900000000` 也只返回会话本人，客户端不应传这些参数。不要将 token 放在 URL。
+
+请求示例：
+
+```http
+GET /user/me/identity HTTP/1.1
+Host: <api-host>
+Authorization: Bearer <valid-token>
+Accept: application/json
+```
+
+无请求体。非法认证示例：相同请求省略 `Authorization`，返回 401，不返回身份。
+
+### 返回参数
+
+| 字段 | JSON 类型 | 必返 | 空值/枚举 | 含义 | 示例 |
+|---|---|---|---|---|---|
+| user_id | string | 是 | 不为空；无枚举 | 已认证账户的十进制用户 ID 字符串，不是手机号、JWT 中未经核验的声明或请求选择的用户 | `"9007199254740993"` |
+
+成功示例（注意是字符串而非 JSON 数字）：
+
+```json
+{"user_id":"9007199254740993"}
+```
+
+### 使用方法与业务规则
+
+先取得有效的登录 Bearer，再调用此接口；以返回的完整字符串作为当前账户的标识，避免转换为 JavaScript `Number` 导致大整数精度丢失。仅按账户隔离本地订单幂等记录，不能把此 ID 当认证凭证或替代订单接口的服务端授权；不要信任本地保存的手机号、请求中的目标 ID 或管理员可查询其他人的 `/user/info` 作为当前会话身份。每次登录、切换账号或恢复会话时重新取得并核对身份；不能跨账户沿用结果，认证失败时不要使用旧身份继续处理订单。返回仅有 `user_id`，不返回手机号、openid、角色或 token。
+
+该接口只读且幂等，无状态流转、额度扣减、费用或 `Idempotency-Key` 要求；并发请求分别验证会话，不会变更账户数据。无接口专属限流配置；部署层可能有限制。会话失效、撤销、账户冻结或注销后依现有认证规则拒绝请求，不存在空结果或匿名身份。有效会话检查依赖认证数据库；存储故障不得降级为成功。
+
+### 错误
+
+无独立业务错误码；错误响应使用项目统一的 `detail` 字符串。
+
+| HTTP | 触发条件 | 响应示例 | 客户端处理 |
+|---|---|---|---|
+| 401 | 缺少、无效、过期或撤销的凭证；禁用的 UUID 认证 | `{\"detail\":\"缺少认证令牌\"}` 或 `{\"detail\":\"认证令牌无效或已过期\"}` | 停止当前账户操作，重新登录；缺少令牌时还返回 `WWW-Authenticate: Bearer` |
+| 403 | 会话账户已冻结或注销 | `{\"detail\":\"账号已冻结或注销\"}` | 停止操作，按账户状态处理 |
+| 503 | 认证存储不可用 | `{\"detail\":\"认证服务暂不可用\"}` | 停止操作，稍后重试；不得沿用旧身份冒充成功 |
+
+### 兼容性与变更记录
+
+新增此独立路径及响应模型，不改变 `/user/info`、登录响应或其他既有接口；旧客户端无需迁移，未废弃字段。新客户端应调用本接口获取会话本人 ID，并将字符串原样保存；登录响应中的数值 `uid` 及可由管理员查询他人的 `/user/info` 均不提供本接口的精确身份契约。本接口不依赖权益接口。
 
 ## Send password-reset SMS
 
@@ -40,7 +99,9 @@ Example `{"session_id":"0123456789abcdef0123456789abcdef","expired_in":300,"retr
 
 ### Usage and business rules
 
-Call issuance before reset. Only latest challenge for the same mobile/purpose/subject is usable, even if a newer send was rejected/unknown. Six-digit cryptographically random code; stored HMAC uses independent SMS_CODE_SECRET (minimum32 characters), bound to random session. TTL5 minutes. Scope counters use MySQL row locks, not process memory: mobile5/hour with60-second cooldown, IP20/hour, device10/hour, global SMS_GLOBAL_HOURLY_LIMIT/hour (default1000). Client cannot select trusted IP: request.client.host is used, not forwarded headers. Deploy behind a correctly configured trusted proxy to avoid all clients sharing one transport peer. Failure increments are mobile+purpose scoped5/hour and persist across resend. Successful business operation and consume commit together; rejected attempts are committed before400. Reissuing does not reset attempts. Do not blindly retry uncertain sends or claim exactly-once SMS delivery.
+Call issuance before reset. Only latest challenge for the same mobile/purpose/subject is usable, even if a newer send was rejected/unknown. Six-digit cryptographically random code; stored HMAC uses independent SMS_CODE_SECRET (minimum32 characters), bound to random session. TTL5 minutes. Scope counters use MySQL row locks, not process memory: mobile5/hour with60-second cooldown, IP20/hour, device10/hour, global SMS_GLOBAL_HOURLY_LIMIT/hour (default1000). Client cannot select trusted IP: request.client.host is used, not forwarded headers. Deploy behind a correctly configured trusted proxy to avoid all clients sharing one transport peer. For password reset, only the latest accepted, unexpired, unconsumed challenge with matching account and session_id reaches the mobile+purpose scoped five-attempt/hour counter; it persists across resend, including successful checks. Wrong, expired or superseded handles do not spend that counter. Bankcard accounting is unchanged. Successful business operation and consume commit together; rejected attempts are committed before400. Do not blindly retry uncertain sends or claim exactly-once SMS delivery.
+
+**Residual availability risk / issue 222 not fully resolved:** the session_id is returned to the anonymous sender, not proof of phone ownership. Someone who initiates a send or learns the latest session_id can still submit five wrong codes and exhaust the shared limit, and issuance cooldown/limits can also be abused. Retaining the cross-resend limit prevents bypassing the existing brute-force bound but cannot guarantee recovery availability against this attacker. Do not characterize this candidate as eliminating denial of service; further independently reviewed recovery/anti-abuse design is required.
 
 ### Errors
 
@@ -48,7 +109,18 @@ Call issuance before reset. Only latest challenge for the same mobile/purpose/su
 
 ## Redeem password reset
 
-`POST /user/reset-password`, anonymous JSON. Body fields: `mobile` string required (same exact identity used at issuance); `sms_code` string required exactly6 decimal digits; `new_password` string required8–72 characters. Request `{"mobile":"19900000001","sms_code":"382746","new_password":"New-synthetic-pass-42!"}`; invalid `sms_code:"1"` →422. Success `{"msg":"密码已重置"}` (`msg`: required string human result).400 covers invalid/expired/consumed/wrong-purpose/wrong-subject/attempt-locked codes, unknown accounts, and issuance/current-account identity mismatch;500 transaction failure. There is no unregistered-target404 response on this route. Redemption first locks the current account at the mobile and requires its ID to equal the challenge's issuance account ID; a code issued before number reassignment cannot reset the new owner. Correct code is single use: two independent transactions can produce only one successful reset. Password hash update, challenge consumption, target session deletion and audit are one transaction. Error before commit rolls back all four. Frontend must clear all stored credentials and return to login after success.
+`POST /user/reset-password`, anonymous, `Content-Type: application/json`, HTTP200 on success; no role or Authorization required.
+
+| Body field | Type | Required/default | Validation and meaning | Legal / illegal |
+|---|---|---|---|---|
+| mobile | string | required | Exact mobile used when issuing | `19900000001` / different mobile |
+| session_id | string | required | **Changed:** latest issuance response, exactly 32 lowercase hexadecimal characters; treat as a secret bearer challenge and never log it | `0123456789abcdef0123456789abcdef` / `bad` |
+| sms_code | string | required | Exactly six digits, from the SMS | `382746` / `1` |
+| new_password | string | required | 8–72 characters | `New-synthetic-pass-42!` / `short` |
+
+Request: `POST /user/reset-password`, header `Content-Type: application/json`, body `{"mobile":"19900000001","session_id":"0123456789abcdef0123456789abcdef","sms_code":"382746","new_password":"New-synthetic-pass-42!"}`. Missing/malformed `session_id` or malformed code returns422. Success HTTP200 `{"msg":"密码已重置"}`: `msg` is a required non-null human-readable string.
+
+First request SMS; retain the returned handle for that specific latest send and submit it with the code. A new send supersedes the previous challenge even if the provider rejects it. 400 `{"detail":"验证码错误或已过期"}` covers invalid, expired, consumed, superseded, wrong-purpose/subject/account/handle, and attempt-locked challenges, including unknown accounts; obtain a new challenge subject to existing issuance and attempt limits. The same challenge can succeed only once under concurrency; successful password update, consumption, session revocation and audit are one transaction. 422 `{"detail":[...]}` means correct the request; 500 means transaction failure, not success. Never infer delivery from provider acceptance. The mobile owner is locked and must match the account ID stored at issuance; mobile reassignment invalidates outstanding challenges. No unregistered-target404 is returned. After success, clear stored credentials and return to login.
 
 ## Operator mutation matrix
 
