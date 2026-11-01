@@ -366,18 +366,22 @@ async def refresh_qrcode(
 
 
 # ------------------ 3. 订单详情 ------------------
-@router.get("/dingdan/xiangqing/{order_no}", summary="订单详情")
+@router.get("/dingdan/xiangqing/{order_no}", summary="订单详情", responses={403: {"description": "只能查询本人优惠券"}})
 async def get_order_detail(
     order_no: str,
-    user_id: int = Query(..., description="用户ID"),
+    user_id: Optional[int] = Query(None, description="兼容旧客户端的用户ID；省略使用当前登录用户，传入时必须与本人一致"),
     current_user: dict = Depends(get_current_user)
 ):
+    if user_id is not None and user_id != current_user["id"]:
+        raise HTTPException(status_code=403, detail="只能查询本人优惠券")
     try:
         result = await OfflineService.get_order_detail(
             order_no=order_no,
-            user_id=user_id
+            user_id=current_user["id"]
         )
         return {"code": 0, "message": "查询成功", "data": result}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error('offline_order_query_failed')
         raise HTTPException(status_code=400, detail=str(e))

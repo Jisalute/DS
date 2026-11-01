@@ -104,6 +104,26 @@ def test_reset_unknown_or_superseded_handle_does_not_spend_attempts(http, users,
         assert http.post('/user/reset-password',json={**body,'session_id':session}).status_code == 400
     assert http.post('/user/reset-password',json={**body,'session_id':second.json()['session_id'],'sms_code':codes[-1]}).status_code == 200
 
+def test_reset_valid_fifth_check_succeeds_once(http, users, db, monkeypatch):
+    from services import auth_security_service as service
+    codes=[]
+    monkeypatch.setattr(service,'send_sms',lambda mobile,code,purpose,request_id: codes.append(code) or 'controlled')
+    mobile=_mobile(db,users[0])
+    issued=http.post('/user/reset-password/sms',json={'mobile':mobile,'device_id':'fifth-check-device-0001'})
+    assert issued.status_code == 200
+    session=issued.json()['session_id']
+    wrong='000000' if codes[0] != '000000' else '111111'
+    body={'mobile':mobile,'session_id':session,'sms_code':wrong,'new_password':'Fifth-check-synthetic42!'}
+    for _ in range(4):
+        assert http.post('/user/reset-password',json=body).status_code == 400
+    assert http.post('/user/reset-password',json={**body,'sms_code':codes[0]}).status_code == 200
+    assert http.post('/user/reset-password',json={**body,'sms_code':codes[0]}).status_code == 400
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT attempt_count FROM auth_sms_limits WHERE scope_hash=%s',(service.digest('attempt:'+mobile+':password_reset'),))
+            assert cur.fetchone()['attempt_count'] == 5
+
+
 
 def test_legacy_jwt_and_logout(http, users, token, db):
     from core.auth import invalidate_token

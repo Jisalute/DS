@@ -19,20 +19,43 @@ class PyMySQLAdapter:
     def __init__(self):
         self._conn = None
         self._cursor = None
+        self._connection_context = None
+        self._failed = False
+
+    def _connect(self):
+        if self._failed:
+            raise RuntimeError('事务已失败，请先回滚再开始新事务')
+        if self._conn is None:
+            context = get_conn()
+            conn = context.__enter__()
+            self._connection_context = context
+            self._conn = conn
+            try:
+                # DBUtils only disables transparent statement replay inside begin().
+                conn.begin()
+                self._cursor = conn.cursor()
+            except BaseException:
+                try:
+                    self.close()
+                except Exception:
+                    logging.getLogger(__name__).exception('事务建立失败后的清理失败')
+                raise
     
     @contextmanager
     def begin(self):
         """开始事务（上下文管理器）"""
-        if self._conn is None:
-            self._conn = get_conn().__enter__()
-            self._cursor = self._conn.cursor()
+        self._connect()
         try:
             yield self
-            self._conn.commit()
+            self.commit()
         except Exception:
-            if self._conn:
-                self._conn.rollback()
+            try:
+                self.rollback()
+            except Exception:
+                logging.getLogger(__name__).exception('事务回滚失败')
             raise
+        finally:
+            self.close()
     
     def execute(self, sql: str, params: Optional[Dict[str, Any]] = None):
         """
@@ -45,37 +68,22 @@ class PyMySQLAdapter:
         Returns:
             ResultProxy 对象，用于访问查询结果
         """
-        if self._conn is None:
-            self._conn = get_conn().__enter__()
-            self._cursor = self._conn.cursor()
-        
-        # 简单校验 SQL，拒绝包含多语句或注释的输入
-        self._validate_sql(sql)
-
-        # 将 :param 格式转换为 %s 格式
-        if params:
-            sql, values = self._convert_sql_params(sql, params)
-        else:
-            values = None
-
-        logger = logging.getLogger(__name__)
-        logger.debug("Executing SQL: %s | params: %s", sql, values)
         try:
+            self._connect()
+            self._validate_sql(sql)
+            if params:
+                sql, values = self._convert_sql_params(sql, params)
+            else:
+                values = None
             self._cursor.execute(sql, values)
-        except (pymysql.err.InterfaceError, pymysql.err.OperationalError) as e:
-            # 连接可能已断开或游标已关闭，尝试重建连接并重试一次
-            logger.warning("DB execute failed, reconnecting and retrying: %s; SQL=%s; params=%s", e, sql, values)
+        except Exception:
+            # A failed statement must never be replayed without its preceding writes.
+            self._failed = True
             try:
-                # 关闭已有资源并重建
                 self.close()
-                self._conn = get_conn().__enter__()
-                self._cursor = self._conn.cursor()
-                logger.debug("Retrying SQL after reconnect: %s | params: %s", sql, values)
-                self._cursor.execute(sql, values)
-            except Exception as e2:
-                # 若重试也失败，记录详细信息并抛出原始异常
-                logger.exception("DB retry failed: %s; SQL=%s; params=%s", e2, sql, values)
-                raise
+            except Exception:
+                logging.getLogger(__name__).exception('失败事务清理失败')
+            raise
 
         return ResultProxy(self._cursor)
 
@@ -211,42 +219,59 @@ class PyMySQLAdapter:
         return result_sql, tuple(param_list)
     
     def commit(self):
-        """提交事务"""
-        if self._conn:
-            self._conn.commit()
-    
+        """提交整笔事务并释放连接；失败后不得继续提交。"""
+        if self._failed:
+            raise RuntimeError('事务已失败，请先回滚再开始新事务')
+        try:
+            if self._conn:
+                self._conn.commit()
+        except Exception:
+            self._failed = True
+            try:
+                self.close()
+            except Exception:
+                logging.getLogger(__name__).exception('提交失败后的清理失败')
+            raise
+        else:
+            # COMMIT acknowledged success; cleanup cannot turn it into failure.
+            try:
+                self.close(_rollback=False)
+            except Exception:
+                logging.getLogger(__name__).exception('已提交事务的连接释放失败')
+
     def rollback(self):
-        """回滚事务"""
-        if self._conn:
-            self._conn.rollback()
-    
-    def close(self):
-        """关闭连接"""
-        logger = logging.getLogger(__name__)
-        if self._cursor:
+        """回滚整笔事务并释放连接，允许显式开始新事务。"""
+        try:
+            self.close()
+        finally:
+            self._failed = False
+
+    def close(self, *, _rollback=True):
+        """释放连接；只有未确认提交的事务需要显式回滚。"""
+        conn, cursor, context = self._conn, self._cursor, self._connection_context
+        self._conn = self._cursor = self._connection_context = None
+        try:
+            if conn is not None and _rollback:
+                conn.rollback()
+        finally:
             try:
-                self._cursor.close()
-            except Exception as e:
-                logger.debug("ignoring cursor.close() error: %s", e)
-        if self._conn:
-            try:
-                self._conn.close()
-            except Exception as e:
-                # pymysql may raise Error("Already closed") if connection was closed
-                logger.debug("ignoring conn.close() error: %s", e)
+                if cursor is not None:
+                    cursor.close()
             finally:
-                self._conn = None
-                self._cursor = None
+                if context is not None:
+                    context.__exit__(None, None, None)
     
     def __enter__(self):
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type:
-            self.rollback()
+            try:
+                self.rollback()
+            except Exception:
+                logging.getLogger(__name__).exception('事务回滚失败')
         else:
             self.commit()
-        self.close()
 
 
 def build_in_placeholders(values: Iterable) -> Tuple[str, dict]:
