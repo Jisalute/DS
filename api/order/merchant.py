@@ -1,9 +1,10 @@
 from fastapi import APIRouter, HTTPException, Query, Depends
-from pydantic import BaseModel, field_validator, StringConstraints
+from pydantic import BaseModel, Field, field_validator, StringConstraints
 from typing import Optional, List, Dict, Any, Annotated
 from core.database import get_conn
 from core.config import settings
 from services.finance_service import get_balance, withdraw
+from core.exceptions import PayoutUnavailableError
 from decimal import Decimal
 from .refund import RefundManager
 from core.logging import get_logger
@@ -307,7 +308,7 @@ class MWxShippingMsgJumpPath(BaseModel):
 
 
 class MWithdraw(BaseModel):
-    amount: float
+    amount: Decimal = Field(..., gt=0, allow_inf_nan=False, description="正数提现金额；付款服务未接入，合法申请返回503且不扣余额")
 
 
 class MBindBank(BaseModel):
@@ -398,12 +399,13 @@ def m_refund_audit(body: MRefundAudit, current_user: dict = Depends(get_current_
     return {"ok": True}
 
 
-@router.post("/withdraw", summary="申请提现", operation_id="merchant_withdraw")
-def m_withdraw(body: MWithdraw, _: dict = Depends(require_platform_admin)):
-    ok = withdraw(Decimal(str(body.amount)))
-    if not ok:
-        raise HTTPException(status_code=400, detail="余额不足")
-    return {"ok": True}
+@router.post("/withdraw", summary="申请提现", operation_id="merchant_withdraw",
+             responses={503: {"description": "付款服务未接入，不扣款或宣称提现成功；detail为安全通用消息"}})
+def m_withdraw(body: MWithdraw, actor: dict = Depends(require_platform_admin)):
+    try:
+        withdraw(body.amount, merchant_id=int(actor['id']))
+    except PayoutUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.post("/bind_bank", summary="绑定银行卡", operation_id="merchant_bind_bank")

@@ -21,7 +21,7 @@ from core.config import (
 )
 from core.database import get_conn, get_db_config_cached
 from core.db_adapter import PyMySQLAdapter
-from core.exceptions import FinanceException, OrderException, InsufficientBalanceException
+from core.exceptions import FinanceException, OrderException, InsufficientBalanceException, PayoutUnavailableError
 from core.logging import get_logger
 from core.table_access import build_dynamic_select, get_table_structure, _quote_identifier
 from core.table_access import build_dynamic_select, get_table_structure, _quote_identifier, build_select_list
@@ -2044,77 +2044,13 @@ class FinanceService:
             return None
 
     def audit_withdrawal(self, withdrawal_id: int, approve: bool, auditor: str = 'admin') -> bool:
-        """审核提现申请"""
-        # ============= 关键修复：移除 try...except，让 FinanceException 直接抛出 =============
+        """Fail closed until payout evidence and reserved-funds provenance exist."""
+        if approve:
+            raise PayoutUnavailableError('提现付款服务尚未接入，不能确认到账；申请及资金保持原状')
 
-        # 查询表结构（只读操作，无需事务）
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SHOW COLUMNS FROM withdrawals")
-                columns = cur.fetchall()
-
-        # 执行审核（需要事务）
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                # 动态构造SELECT语句并锁定行
-                asset_keywords = ['balance', 'points', 'amount', 'total', 'frozen', 'available', 'tax']
-                select_fields = []
-
-                for col in columns:
-                    field_name = col['Field']
-                    field_type = col['Type'].upper()
-                    is_asset_field = any(keyword in field_name.lower() for keyword in asset_keywords)
-                    is_numeric_type = 'DECIMAL' in field_type or 'INT' in field_type
-
-                    if is_asset_field and is_numeric_type:
-                        select_fields.append(f"COALESCE(`{field_name}`, 0) AS `{field_name}`")
-                    else:
-                        select_fields.append(f"`{field_name}`")
-
-                # 使用条件更新避免长时间锁定行：先尝试原子性更新状态
-                new_status = 'approved' if approve else 'rejected'
-                cur.execute(
-                    """UPDATE withdrawals SET status = %s, audit_remark = %s, processed_at = NOW()
-                       WHERE id = %s AND status IN ('pending_auto','pending_manual')""",
-                    (new_status, f"{auditor}审核", withdrawal_id)
-                )
-
-                if cur.rowcount == 0:
-                    raise FinanceException("提现记录不存在或已处理")
-
-                # 读取记录以便后续处理（短查询）
-                cur.execute(f"SELECT {build_select_list(select_fields)} FROM withdrawals WHERE id = %s",
-                            (withdrawal_id,))
-                withdraw = cur.fetchone()
-
-                if approve:
-                    cur.execute(
-                        "INSERT INTO account_flow(account_type,related_user,change_amount,balance_after,flow_type,remark,created_at) VALUES('withdrawal',%s,%s,0,'income',%s,NOW())",
-                        (withdraw['user_id'], withdraw['actual_amount'], f'提现到账 #{withdrawal_id} 操作者:{auditor}'),
-                    )
-                    logger.debug('finance_operation_detail')
-                else:
-                    # 退回金额
-                    balance_field = 'promotion_balance' if withdraw.get('withdrawal_type',
-                                                                        'user') == 'user' else 'merchant_balance'
-                    cur.execute(
-                        f"UPDATE users SET `{balance_field}` = COALESCE(`{balance_field}`, 0) + %s WHERE id = %s",
-                        (withdraw['amount'], withdraw['user_id'])
-                    )
-
-                    cur.execute(f'SELECT `{balance_field}` AS balance FROM users WHERE id=%s', (withdraw['user_id'],))
-                    balance_after = cur.fetchone()['balance']
-                    cur.execute(
-                        "INSERT INTO account_flow(account_type,related_user,change_amount,balance_after,flow_type,remark,created_at) VALUES(%s,%s,%s,%s,'income',%s,NOW())",
-                        (balance_field, withdraw['user_id'], withdraw['amount'], balance_after, f'提现拒绝退回 #{withdrawal_id} 操作者:{auditor}'),
-                    )
-                    logger.debug('finance_operation_detail')
-
-                # 提交事务
-                conn.commit()
-                return True
-
-        # 移除 try...except 块，让 FinanceException 直接向上抛出
+        # Legacy requests do not persist verifiable per-request debit provenance.
+        # A type label alone cannot establish which balance actually funded one.
+        raise PayoutUnavailableError('提现扣款来源无法核验，不能自动退回；申请及资金保持原状，请人工对账')
 
     def _record_flow(self, account_type: str, related_user: Optional[int],
                      change_amount: Decimal, flow_type: str,
@@ -8357,35 +8293,8 @@ def bind_bank(bank_name: str, bank_account: str, merchant_id: int = 1):
 
 
 def withdraw(amount: Decimal, merchant_id: int = 1) -> bool:
-    """商家提现（改用 users.merchant_balance）
-
-    参数:
-        amount: 提现金额
-        merchant_id: 商家ID，默认为1
-
-    返回:
-        bool: 提现是否成功
-    """
-    from core.database import get_conn
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            # 1. 查余额
-            cur.execute(
-                "SELECT merchant_balance FROM users WHERE id=%s",
-                (merchant_id,)
-            )
-            row = cur.fetchone()
-            if not row or Decimal(str(row["merchant_balance"] or 0)) < amount:
-                return False
-
-            # 2. 扣余额
-            cur.execute(
-                "UPDATE users SET merchant_balance=merchant_balance-%s WHERE id=%s",
-                (amount, merchant_id)
-            )
-            conn.commit()
-            return True
+    """Legacy direct withdrawal is unavailable without trusted provider settlement."""
+    raise PayoutUnavailableError('提现付款服务尚未接入，不能扣款或确认到账；资金保持原状')
 
 
 def settle_to_merchant(amount: Decimal, merchant_id: int = 1):

@@ -11,7 +11,7 @@ from core.logging import get_logger
 from core.table_access import build_dynamic_select
 from database_setup import DatabaseManager
 from services.finance_service import FinanceService
-from core.exceptions import FinanceException, OrderException, InsufficientBalanceException
+from core.exceptions import FinanceException, OrderException, InsufficientBalanceException, PayoutUnavailableError
 from core.config import (
     settings,
     PLATFORM_MERCHANT_ID,
@@ -404,7 +404,8 @@ async def get_public_welfare_report(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.patch("/api/withdrawals/audit", response_model=ResponseModel, summary="审核提现")
+@router.patch("/api/withdrawals/audit", response_model=ResponseModel, summary="审核提现",
+              responses={503: {"description": "付款证据或逐申请扣款来源未就绪；批准和拒绝均不修改申请、余额或流水；detail经全局处理为安全通用消息"}})
 async def audit_withdrawal(
         request: WithdrawalAuditRequest,
         service: FinanceService = Depends(get_finance_service),
@@ -424,6 +425,8 @@ async def audit_withdrawal(
         else:
             raise HTTPException(status_code=500, detail="审核失败，请检查日志")
 
+    except PayoutUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
     except FinanceException as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

@@ -4,6 +4,10 @@ class FinanceException(Exception):
     """财务系统基础异常"""
     pass
 
+class PayoutUnavailableError(FinanceException):
+    """Trusted payout evidence or reserved-funds provenance is unavailable."""
+
+
 
 class OrderException(FinanceException):
     """订单相关异常"""

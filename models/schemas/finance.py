@@ -51,9 +51,9 @@ class WithdrawalRequest(BaseModel):
 
 class WithdrawalAuditRequest(BaseModel):
     """提现审核请求模型"""
-    withdrawal_id: int = Field(..., gt=0)
-    approve: bool
-    auditor: str = Field('admin', min_length=1)
+    withdrawal_id: int = Field(..., gt=0, description="已有提现申请 ID")
+    approve: bool = Field(..., description="审核意图；true因付款证据缺失、false因扣款来源未核验均返回503，不修改申请或资金")
+    auditor: str = Field('admin', min_length=1, description="旧客户端兼容字段，不作为可信操作者；实际使用管理员会话 ID")
 
 
 class RewardAuditRequest(BaseModel):
