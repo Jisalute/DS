@@ -1773,7 +1773,9 @@ class FinanceService:
     @staticmethod
     def revoke_order_discounts(order_number: str, external_cur=None) -> None:
         """
-        订单退款成功后，回退用户使用的积分和优惠券，并收回因该订单获得的积分。
+        订单全额退款成功后，回退使用的优惠券并回退会员等级。
+        积分回冲（退回下单抵扣的积分、收回本单奖励的积分）已移到
+        reverse_split_on_refund，按累计退款比例执行，部分退款同样生效。
         注意：如果提供了 external_cur，则在该游标所在事务中执行，由调用方负责提交；
             否则使用独立连接并自行提交。
         """
@@ -1806,23 +1808,10 @@ class FinanceService:
 
             user_id = order['user_id']
             order_id = order['id']
-            pending_points = Decimal(str(order.get('pending_points') or 0))
             pending_coupon_ids_json = order.get('pending_coupon_ids')
 
-            # 2. 退回使用的积分（加回用户积分余额）
-            if pending_points > 0:
-                cur.execute("""
-                    UPDATE users
-                    SET member_points = member_points + %s
-                    WHERE id = %s
-                """, (pending_points, user_id))
-                cur.execute("SELECT member_points FROM users WHERE id = %s", (user_id,))
-                new_balance = cur.fetchone()['member_points']
-                cur.execute("""
-                    INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
-                    VALUES (%s, %s, %s, 'member', %s, %s, NOW())
-                """, (user_id, pending_points, new_balance, f"订单退款退回积分: {order_number}", order_id))
-                logger.info('finance_operation_state')
+            # 说明：下单时抵扣的积分与订单奖励积分的回冲已改到 reverse_split_on_refund，
+            # 那里按累计退款比例处理，部分退款也生效。此处只负责优惠券和会员等级。
 
             # 3. 退回使用的优惠券（线上：pending_coupon_ids；线下：券只记在 offline_order）
             coupon_ids: list = []
@@ -1859,51 +1848,31 @@ class FinanceService:
                 else:
                     logger.info('finance_operation_state')
 
-            # 4. 收回因该订单获得的积分（线上发放 + 线下实付发放；历史线下行 related_order 可能为 NULL）
-            offline_grant_reason = f"线下订单支付获得积分: {order_number}"
+            # 4. 会员等级回退：全额退款时，按本单会员商品数量降级。
             cur.execute(
                 """
-                SELECT SUM(change_amount) as total_granted
-                FROM points_log
-                WHERE user_id = %s
-                AND type = 'member'
-                AND change_amount > 0
-                AND (
-                    (
-                        related_order = %s
-                        AND reason IN (
-                            '购买会员商品获得积分',
-                            '购买普通商品获得积分',
-                            '购买商品赠送积分',
-                            %s
-                        )
-                    )
-                    OR (related_order IS NULL AND reason = %s)
-                )
+                SELECT COALESCE(SUM(oi.quantity), 0) AS member_qty
+                FROM order_items oi
+                JOIN products p ON oi.product_id = p.id
+                WHERE oi.order_id = %s AND p.is_member_product = 1
                 """,
-                (user_id, order_id, offline_grant_reason, offline_grant_reason),
+                (order_id,),
             )
-            row = cur.fetchone()
-            total_granted = Decimal(str(row['total_granted'] or 0))
-            if total_granted > 0:
-                # 查询当前余额
-                cur.execute("SELECT member_points FROM users WHERE id = %s", (user_id,))
-                current_points = Decimal(str(cur.fetchone()['member_points'] or 0))
-                actual_deduct = min(total_granted, current_points)
-                if actual_deduct > 0:
-                    cur.execute("""
-                        UPDATE users
-                        SET member_points = member_points - %s
-                        WHERE id = %s
-                    """, (actual_deduct, user_id))
-                    new_balance = current_points - actual_deduct
-                    cur.execute("""
-                        INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
-                        VALUES (%s, %s, %s, 'member', %s, %s, NOW())
-                    """, (user_id, -actual_deduct, new_balance, f"订单退款收回奖励积分: {order_number}", order_id))
-                    logger.info('finance_operation_state')
-                else:
-                    logger.warning('finance_operation_warning')
+            member_qty = int((cur.fetchone() or {}).get('member_qty') or 0)
+            if member_qty > 0:
+                cur.execute("SELECT member_level FROM users WHERE id=%s FOR UPDATE", (user_id,))
+                level_row = cur.fetchone()
+                current_level = int((level_row or {}).get('member_level') or 0)
+                target_level = max(0, current_level - member_qty)
+                if target_level != current_level:
+                    cur.execute(
+                        "UPDATE users SET member_level=%s, level_changed_at=NOW() WHERE id=%s",
+                        (target_level, user_id),
+                    )
+                    logger.info(
+                        'member_level_reverted order=%s user=%s from=%s to=%s',
+                        order_number, user_id, current_level, target_level,
+                    )
             finish_event(cur, 'discount_refund', order_number)
 
         if external_cur is not None:
@@ -8163,7 +8132,10 @@ def _execute_split(cur, order_number: str, total: Decimal):
 def reverse_split_on_refund(order_number: str, external_conn=None, event_key=None, refund_amount=None):
     """Reverse each refund's proportional share in the order transaction."""
     def apply(cur):
-        cur.execute('SELECT id,total_amount FROM orders WHERE order_number=%s FOR UPDATE', (order_number,))
+        cur.execute(
+            'SELECT id,user_id,total_amount,pending_points FROM orders WHERE order_number=%s FOR UPDATE',
+            (order_number,),
+        )
         order = cur.fetchone()
         if not order:
             raise FinanceException('退款订单不存在')
@@ -8220,6 +8192,202 @@ def reverse_split_on_refund(order_number: str, external_conn=None, event_key=Non
             cur.execute("INSERT INTO account_flow(account_type,change_amount,balance_after,flow_type,remark,created_at) VALUES(%s,%s,%s,%s,%s,NOW())",
                         (account, -delta, balance, 'expense' if delta > 0 else 'income', f'退款回冲: {order_number}'))
             applied[account] = str(delta)
+
+        # ===== 用户资产回冲：赠送雨点、推荐奖励、团队奖励 =====
+        # 退款后，该订单产生的雨点及其派生的推荐/团队奖励一并从用户余额扣回。
+        # 口径：按累计退款比例扣减；余额不足时扣到 0 为止（不追负），
+        # 雨点余额的差额优先作废该用户未使用的优惠券（雨点月结转产物）。
+        cum_ratio = ((refunded + amount) / total) if total else Decimal('1')
+        cur.execute(
+            """
+            SELECT account_type, related_user, SUM(change_amount) AS delta
+            FROM account_flow
+            WHERE related_user IS NOT NULL
+              AND (
+                    (account_type='true_total_points' AND remark = CONCAT('购买商品赠送雨点 - 订单#', %s))
+                 OR (account_type='referral_points' AND remark = CONCAT('普通商品推荐奖励 - 订单', %s))
+                 OR (account_type='referral_points' AND remark = CONCAT('推荐奖励 - 订单#', %s))
+                 OR (account_type='team_reward_points' AND SUBSTRING_INDEX(remark, '订单#', -1) = %s)
+              )
+            GROUP BY account_type, related_user
+            """,
+            (order_number, order_number, str(order['id']), str(order['id'])),
+        )
+        wants: dict = {}
+        for row in cur.fetchall() or []:
+            account = row['account_type']
+            user_id = int(row['related_user'] or 0)
+            original = Decimal(str(row['delta'] or 0))
+            if user_id <= 0 or original <= 0:
+                continue
+            target = (original * cum_ratio).quantize(Decimal('0.0001'))
+            if target <= 0:
+                continue
+            # 推荐/团队奖励发放时同时写入了 true_total_points，回冲时两个字段都要扣。
+            wants[(user_id, 'true_total_points')] = (
+                wants.get((user_id, 'true_total_points'), Decimal('0')) + target
+            )
+            if account != 'true_total_points':
+                wants[(user_id, account)] = wants.get((user_id, account), Decimal('0')) + target
+
+        for (user_id, field), want in wants.items():
+            if field not in ('true_total_points', 'referral_points', 'team_reward_points'):
+                continue
+            marker = f'user:{user_id}:{field}'
+            previous = sum(
+                (
+                    Decimal(str(prior_row.get('accounts', {}).get(marker, '0')))
+                    for prior_row in prior
+                    if isinstance(prior_row, dict)
+                ),
+                Decimal('0'),
+            )
+            need = want - previous
+            if need <= 0:
+                continue
+
+            cur.execute(f"SELECT COALESCE({field}, 0) AS bal FROM users WHERE id=%s FOR UPDATE", (user_id,))
+            user_row = cur.fetchone()
+            balance_before = Decimal(str(user_row['bal'] or 0)) if user_row else Decimal('0')
+            taken = min(need, balance_before)
+            if taken > 0:
+                balance_after = balance_before - taken
+                cur.execute(f"UPDATE users SET {field}=%s WHERE id=%s", (balance_after, user_id))
+                cur.execute(
+                    "INSERT INTO account_flow(account_type,related_user,change_amount,balance_after,flow_type,remark,created_at) "
+                    "VALUES(%s,%s,%s,%s,'expense',%s,NOW())",
+                    (field, user_id, -taken, balance_after, f'退款回冲: {order_number}'),
+                )
+
+            shortfall = need - taken
+            if shortfall > 0 and field == 'true_total_points':
+                # 雨点已月结转为优惠券的部分：作废未使用券，按到期日从近到远。
+                cur.execute(
+                    "SELECT id, amount FROM coupons WHERE user_id=%s AND status='unused' "
+                    "AND coupon_type='user' AND valid_to >= CURDATE() "
+                    "ORDER BY valid_to ASC, id ASC FOR UPDATE",
+                    (user_id,),
+                )
+                voided = Decimal('0')
+                void_ids = []
+                for coupon in cur.fetchall() or []:
+                    if voided >= shortfall:
+                        break
+                    coupon_amount = Decimal(str(coupon['amount'] or 0))
+                    if coupon_amount <= 0:
+                        continue
+                    void_ids.append(coupon['id'])
+                    voided += coupon_amount
+                if void_ids:
+                    placeholders = ','.join(['%s'] * len(void_ids))
+                    cur.execute(
+                        f"UPDATE coupons SET status='expired' WHERE id IN ({placeholders})",
+                        tuple(void_ids),
+                    )
+                    cur.execute(
+                        "INSERT INTO account_flow(account_type,related_user,change_amount,balance_after,flow_type,remark,created_at) "
+                        "VALUES('coupon',%s,%s,NULL,'expense',%s,NOW())",
+                        (user_id, -voided, f'退款回冲作废优惠券: {order_number}'),
+                    )
+
+            if shortfall > 0:
+                logger.warning(
+                    'refund_clawback_shortfall order=%s user=%s field=%s want=%s taken=%s',
+                    order_number, user_id, field, need, taken,
+                )
+
+            # 记录本次应扣额（而非实扣额），确保缺口不重复追讨。
+            applied[marker] = str(need)
+
+        # ===== 会员积分回冲（按累计退款比例） =====
+        # 部分退款同样按比例：退回下单时抵扣的积分、收回本单奖励的积分。
+        # 余额不足时扣到 0 为止（不追负）。
+        buyer_id = int(order.get('user_id') or 0)
+        member_points_used = Decimal(str(order.get('pending_points') or 0))
+        order_db_id = int(order['id'])
+
+        def _applied_sum(marker_key):
+            return sum(
+                (
+                    Decimal(str(prior_row.get('accounts', {}).get(marker_key, '0')))
+                    for prior_row in prior
+                    if isinstance(prior_row, dict)
+                ),
+                Decimal('0'),
+            )
+
+        if buyer_id > 0:
+            # (1) 退回下单时抵扣的积分
+            if member_points_used > 0:
+                used_marker = f'user:{buyer_id}:member_points_used'
+                used_target = (member_points_used * cum_ratio).quantize(Decimal('0.0001'))
+                used_delta = used_target - _applied_sum(used_marker)
+                if used_delta > 0:
+                    cur.execute(
+                        "UPDATE users SET member_points = COALESCE(member_points, 0) + %s WHERE id=%s",
+                        (used_delta, buyer_id),
+                    )
+                    cur.execute("SELECT member_points FROM users WHERE id=%s", (buyer_id,))
+                    used_balance = Decimal(str(cur.fetchone()['member_points'] or 0))
+                    cur.execute(
+                        "INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at) "
+                        "VALUES (%s, %s, %s, 'member', %s, %s, NOW())",
+                        (buyer_id, used_delta, used_balance, f'订单退款退回积分: {order_number}', order_db_id),
+                    )
+                    applied[used_marker] = str(used_delta)
+
+            # (2) 收回本单奖励的积分（线上发放 + 线下实付发放；历史线下行 related_order 可能为 NULL）
+            offline_grant_reason = f"线下订单支付获得积分: {order_number}"
+            cur.execute(
+                """
+                SELECT SUM(change_amount) AS total_granted
+                FROM points_log
+                WHERE user_id = %s
+                  AND type = 'member'
+                  AND change_amount > 0
+                  AND (
+                        (
+                            related_order = %s
+                            AND reason IN (
+                                '购买会员商品获得积分',
+                                '购买普通商品获得积分',
+                                '购买商品赠送积分',
+                                %s
+                            )
+                        )
+                        OR (related_order IS NULL AND reason = %s)
+                      )
+                """,
+                (buyer_id, order_db_id, offline_grant_reason, offline_grant_reason),
+            )
+            granted_row = cur.fetchone()
+            total_granted = Decimal(str((granted_row or {}).get('total_granted') or 0))
+            if total_granted > 0:
+                reward_marker = f'user:{buyer_id}:member_points_reward'
+                reward_target = (total_granted * cum_ratio).quantize(Decimal('0.0001'))
+                reward_need = reward_target - _applied_sum(reward_marker)
+                if reward_need > 0:
+                    cur.execute(
+                        "SELECT COALESCE(member_points,0) AS bal FROM users WHERE id=%s FOR UPDATE",
+                        (buyer_id,),
+                    )
+                    points_balance = Decimal(str(cur.fetchone()['bal'] or 0))
+                    points_take = min(reward_need, points_balance)
+                    if points_take > 0:
+                        points_after = points_balance - points_take
+                        cur.execute("UPDATE users SET member_points=%s WHERE id=%s", (points_after, buyer_id))
+                        cur.execute(
+                            "INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at) "
+                            "VALUES (%s, %s, %s, 'member', %s, %s, NOW())",
+                            (buyer_id, -points_take, points_after, f'订单退款收回奖励积分: {order_number}', order_db_id),
+                        )
+                    if points_take < reward_need:
+                        logger.warning(
+                            'refund_points_shortfall order=%s user=%s want=%s taken=%s',
+                            order_number, buyer_id, reward_need, points_take,
+                        )
+                    applied[reward_marker] = str(reward_need)
+
         cur.execute("UPDATE finance_events SET result_json=%s WHERE event_kind='refund_split' AND event_key=%s",
                     (json.dumps({'amount': str(amount), 'accounts': applied}), key))
     if external_conn is not None:
